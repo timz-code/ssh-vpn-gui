@@ -235,6 +235,33 @@ def test_disconnect_succeeds_when_remote_cleanup_fails(monkeypatch, tmp_path, ca
     assert any("remote cleanup skipped" in line for line in payload["messages"])
 
 
+def test_disconnect_restores_local_routing_without_routing_cfg(monkeypatch, tmp_path, capsys) -> None:
+    routing_file = tmp_path / "missing.cfg"
+    monkeypatch.setattr(helper, "require_root", lambda: None)
+    monkeypatch.setattr(helper, "stop_dns_proxy", lambda **_kwargs: [])
+    monkeypatch.setattr(helper, "stop_tunnel", lambda **_kwargs: [])
+
+    result = helper.main(
+        [
+            "disconnect",
+            "--local-only",
+            "--routing-file",
+            str(routing_file),
+            "--dry-run",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["ok"] is True
+    assert "nft delete table inet ssh_vpn_gui" in payload["messages"]
+    assert "ip rule del fwmark 2023 table 2023" in payload["messages"]
+    assert "ip route flush table 2023" in payload["messages"]
+    assert "ip route del 0.0.0.0/1" in payload["messages"]
+    assert "ip route del 128.0.0.0/1" in payload["messages"]
+    assert "delete routes using tun3" in payload["messages"]
+
+
 def test_save_routing_rejects_invalid_rules_without_overwriting(
     monkeypatch, tmp_path, capsys
 ) -> None:

@@ -12,7 +12,7 @@ from .geoip import update_geoip
 from .geosite import update_geosite
 from .paths import SYSTEM_ROUTING_FILE
 from .routing_config import parse_routing_file, parse_routing_text
-from .routing_engine import RoutingEngine
+from .routing_engine import RoutingEngine, reset_local_routing
 from .ssh_tunnel import (
     cleanup_remote,
     start_remote_ovpn,
@@ -43,7 +43,7 @@ def main(argv: list[str] | None = None) -> int:
         password = _read_password(args)
         runner = CommandRunner(dry_run=args.dry_run)
         routing_file = Path(args.routing_file)
-        config = None if args.command in {"save-routing", "status"} else parse_routing_file(routing_file)
+        config = None if args.command in {"save-routing", "status", "disconnect"} else parse_routing_file(routing_file)
 
         if args.command == "save-routing":
             content = _read_content(args)
@@ -60,8 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "disconnect":
             messages.extend(stop_dns_proxy(dry_run=args.dry_run))
             messages.extend(stop_tunnel(dry_run=args.dry_run))
-            if args.server:
-                RoutingEngine(config=config, server=args.server).stop(runner)
+            reset_local_routing(runner)
             cleanup_local_tun(runner, args.server)
             messages.extend(runner.commands)
             if args.server and password and not args.local_only:

@@ -36,16 +36,10 @@ class RoutingEngine:
         runner.run(["ip", "rule", "add", "fwmark", PROXY_MARK, "table", PROXY_TABLE, "priority", PROXY_TABLE], check=False)
 
     def stop(self, runner: CommandRunner) -> None:
-        self._reset_policy_routing(runner)
-        cleanup_tun_routes(runner)
+        reset_local_routing(runner)
 
     def _reset_policy_routing(self, runner: CommandRunner) -> None:
-        runner.run(["nft", "delete", "table", "inet", NFT_TABLE], check=False)
-        runner.run(["ip", "rule", "del", "fwmark", PROXY_MARK, "table", PROXY_TABLE], check=False)
-        runner.run(["ip", "route", "flush", "table", PROXY_TABLE], check=False)
-        cleanup_dynamic_proxy_routes(runner)
-        for route in OLD_FORCED_ROUTES:
-            runner.run(["ip", "route", "del", route], check=False)
+        _reset_policy_routing(runner)
 
     def add_static_ip_rules(self, runner: CommandRunner) -> None:
         for rule in self.config.rules:
@@ -122,6 +116,26 @@ def add_resolved_ips(runner: CommandRunner, action: str, addresses: list[str], t
                 _record_proxy_route(runner, str(ip))
             else:
                 runner.run(["ip", "route", "del", f"{ip}/32"], check=False)
+
+
+def reset_local_routing(runner: CommandRunner) -> None:
+    """Remove every local policy-routing artifact this app installs.
+
+    Does not depend on routing.cfg or the remote server. The main default
+    route is never rewritten on connect, so deleting our overlays returns
+    traffic to the system default path.
+    """
+    _reset_policy_routing(runner)
+    cleanup_tun_routes(runner)
+
+
+def _reset_policy_routing(runner: CommandRunner) -> None:
+    runner.run(["nft", "delete", "table", "inet", NFT_TABLE], check=False)
+    runner.run(["ip", "rule", "del", "fwmark", PROXY_MARK, "table", PROXY_TABLE], check=False)
+    runner.run(["ip", "route", "flush", "table", PROXY_TABLE], check=False)
+    cleanup_dynamic_proxy_routes(runner)
+    for route in OLD_FORCED_ROUTES:
+        runner.run(["ip", "route", "del", route], check=False)
 
 
 def cleanup_dynamic_proxy_routes(runner: CommandRunner) -> None:

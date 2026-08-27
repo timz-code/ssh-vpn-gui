@@ -1,5 +1,5 @@
 from ssh_vpn_gui.routing_config import parse_routing_text
-from ssh_vpn_gui.routing_engine import RoutingEngine
+from ssh_vpn_gui.routing_engine import RoutingEngine, reset_local_routing
 from ssh_vpn_gui.system import CommandRunner
 
 
@@ -41,3 +41,18 @@ def test_routing_engine_sets_policy_route_for_marked_proxy_traffic() -> None:
     assert "ip route replace default dev tun3 src 10.255.3.1 table 2023" in runner.commands
     assert "ip rule add fwmark 2023 table 2023 priority 2023" in runner.commands
     assert "delete routes using tun3" not in runner.commands
+
+
+def test_reset_local_routing_removes_overlays_without_touching_main_default() -> None:
+    runner = CommandRunner(dry_run=True)
+
+    reset_local_routing(runner)
+
+    assert "nft delete table inet ssh_vpn_gui" in runner.commands
+    assert "ip rule del fwmark 2023 table 2023" in runner.commands
+    assert "ip route flush table 2023" in runner.commands
+    assert "ip route del 0.0.0.0/1" in runner.commands
+    assert "ip route del 128.0.0.0/1" in runner.commands
+    assert "delete routes using tun3" in runner.commands
+    assert not any("ip route replace default" in command for command in runner.commands)
+    assert not any(command.startswith("ip route add") for command in runner.commands)
