@@ -71,6 +71,9 @@ def test_ssh_command_quotes_multiline_script_as_one_bash_argument() -> None:
     command = ssh_tunnel._ssh_command("203.0.113.10", "root", script, with_tun=False)
 
     assert shlex.split(command[-1]) == ["bash", "-lc", script]
+    assert "TCPKeepAlive=yes" in command
+    assert "ServerAliveInterval=5" in command
+    assert "ServerAliveCountMax=2" in command
 
 
 def test_start_tunnel_dry_run_inserts_ovpn_bootstrap_before_tun() -> None:

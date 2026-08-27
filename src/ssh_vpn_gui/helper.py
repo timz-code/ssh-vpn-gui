@@ -21,6 +21,7 @@ from .ssh_tunnel import (
     stop_tunnel,
 )
 from .system import CommandRunner, cleanup_legacy_singbox, cleanup_local_tun, preserve_server_route, require_root, setup_full_tunnel_routes, setup_local_tun
+from .tunnel_watch import inspect_tunnel
 
 PUBLIC_IP_URLS = (
     "https://ifconfig.me/ip",
@@ -34,14 +35,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     messages: list[str] = []
+    extra: dict | None = None
     try:
-        if not args.dry_run:
+        if not args.dry_run and args.command != "status":
             require_root()
 
         password = _read_password(args)
         runner = CommandRunner(dry_run=args.dry_run)
         routing_file = Path(args.routing_file)
-        config = None if args.command == "save-routing" else parse_routing_file(routing_file)
+        config = None if args.command in {"save-routing", "status"} else parse_routing_file(routing_file)
 
         if args.command == "save-routing":
             content = _read_content(args)
@@ -62,8 +64,23 @@ def main(argv: list[str] | None = None) -> int:
                 RoutingEngine(config=config, server=args.server).stop(runner)
             cleanup_local_tun(runner, args.server)
             messages.extend(runner.commands)
-            if args.server and password:
-                messages.extend(cleanup_remote(args.server, args.login, password, dry_run=args.dry_run))
+            if args.server and password and not args.local_only:
+                try:
+                    messages.extend(
+                        cleanup_remote(
+                            args.server,
+                            args.login,
+                            password,
+                            dry_run=args.dry_run,
+                            timeout=12,
+                        )
+                    )
+                except Exception as exc:
+                    messages.append(f"remote cleanup skipped: {exc}")
+        elif args.command == "status":
+            snapshot = inspect_tunnel()
+            messages.extend(snapshot.messages())
+            extra = {"status": snapshot.as_dict()}
         elif args.command == "routing-on":
             _require_server(args.server)
             engine = RoutingEngine(config=config, server=args.server)
@@ -130,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             raise ValueError(f"Unsupported command {args.command!r}")
 
-        _print_result(ok=True, messages=messages)
+        _print_result(ok=True, messages=messages, extra=extra)
         return 0
     except Exception as exc:
         _print_result(ok=False, error=str(exc), messages=messages)
@@ -151,6 +168,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "save-routing",
             "update-geo",
             "diagnose",
+            "status",
         ],
     )
     parser.add_argument("--server", help="Remote server IP address")
@@ -162,6 +180,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-routing", action="store_true", help="Connect SSH TUN without starting routing rules")
     parser.add_argument("--ovpn-file", help="Path to a .ovpn file to run as a cascaded VPN on the remote server")
     parser.add_argument("--skip-health-check", action="store_true", help="Skip rollback health check after connect")
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Disconnect local tunnel and routes without contacting the remote server",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands without changing the system")
     return parser
 
@@ -199,10 +222,12 @@ def _require_password(password: str | None) -> None:
         raise ValueError("root password is required")
 
 
-def _print_result(*, ok: bool, messages: list[str], error: str | None = None) -> None:
+def _print_result(*, ok: bool, messages: list[str], error: str | None = None, extra: dict | None = None) -> None:
     payload = {"ok": ok, "messages": messages}
     if error:
         payload["error"] = error
+    if extra:
+        payload.update(extra)
     print(json.dumps(payload, ensure_ascii=False))
 
 
@@ -302,6 +327,7 @@ def _curl_public_ip() -> str | None:
 
 
 def _diagnose(server: str | None) -> list[str]:
+    messages = inspect_tunnel().messages()
     commands = [
         ["ip", "addr", "show", "tun3"],
         ["ip", "rule", "show"],
@@ -312,7 +338,6 @@ def _diagnose(server: str | None) -> list[str]:
     ]
     if server:
         commands.append(["ip", "route", "get", server])
-    messages: list[str] = []
     for command in commands:
         completed = subprocess.run(command, text=True, capture_output=True, check=False)
         messages.append("$ " + " ".join(command))

@@ -15,6 +15,8 @@ classifier.
   remote server.
 - GeoIP and Geosite routing data updates from the GUI.
 - Automatic rollback when a connection attempt fails.
+- Detects a dead tunnel after suspend/resume or SSH drop, updates the
+  window, removes leftover routes, and reconnects automatically.
 
 ## Requirements
 
@@ -232,6 +234,16 @@ Common failures:
 - **Connection timed out:** verify the SSH port is reachable.
 - **Tunnel device open failed:** confirm that the VPS provider allows TUN.
 - **Routing data missing:** click **Update Routing Data**.
+- **After sleep the window still said Connected:** older versions did not
+  notice the SSH session dying during suspend. Current versions probe the
+  tunnel on wake (and every few seconds while connected), drop leftover
+  `tun3` routes, and reconnect. If reconnect fails, click **Connect**.
+
+Inspect tunnel liveness without changing the system:
+
+```bash
+ssh-vpn-helper status
+```
 
 Inspect generated commands without making changes:
 

@@ -93,6 +93,16 @@ def start_tunnel(
     return [*messages, f"started ssh tunnel daemon pid {daemon.pid}"]
 
 
+def is_tunnel_daemon_alive() -> bool:
+    if not SSH_PID.exists():
+        return False
+    try:
+        pid = int(SSH_PID.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    return _pid_runs_module(pid, "ssh_vpn_gui.tunnel_daemon")
+
+
 def stop_tunnel(*, dry_run: bool = False) -> list[str]:
     messages: list[str] = []
     if SSH_PID.exists():
@@ -206,9 +216,11 @@ def _ssh_command(server: str, login: str, remote_command: str, *, with_tun: bool
         "-o",
         f"UserKnownHostsFile={KNOWN_HOSTS}",
         "-o",
-        "ServerAliveInterval=10",
+        "TCPKeepAlive=yes",
         "-o",
-        "ServerAliveCountMax=3",
+        "ServerAliveInterval=5",
+        "-o",
+        "ServerAliveCountMax=2",
     ]
     if with_tun:
         command.extend(["-o", "ExitOnForwardFailure=yes", "-w", "3:3"])

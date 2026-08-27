@@ -7,19 +7,39 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 from .paths import SUDOERS_RULE, SYSTEM_HELPER, SYSTEM_ROUTING_FILE
+from .tunnel_watch import TunnelSnapshot, evaluate_tunnel_health, inspect_tunnel
 
 
 APP_ID = "dev.cursor.SshVpnGui"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ssh-vpn-gui"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+WATCH_INTERVAL_MS = 4000
+WALL_SLEEP_GAP_SECONDS = 25
+DEAD_STREAK_LIMIT = 2
+MAX_AUTO_RECONNECTS = 1
+
+
+def wall_clock_implies_sleep(elapsed_seconds: float) -> bool:
+    return elapsed_seconds > WALL_SLEEP_GAP_SECONDS
+
+
+def network_is_available() -> bool | None:
+    try:
+        monitor = Gio.NetworkMonitor.get_default()
+        if not monitor.get_network_available():
+            return False
+        return monitor.get_connectivity() != Gio.NetworkConnectivity.LOCAL
+    except Exception:
+        return None
 
 
 class RoutingEditorWindow(Gtk.Window):
@@ -107,6 +127,17 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self.busy = False
         self._suppress_toggle = False
         self._pending_toggle: tuple[str, bool] | None = None
+        self._watch_source: int | None = None
+        self._watch_in_flight = False
+        self._dead_streak = 0
+        self._last_wall = time.time()
+        self._reaping = False
+        self._pending_reconnect = False
+        self._auto_reconnects = 0
+        self._resume_probe_active = False
+        self._peer_watch_usable = False
+        self._sleep_subscription = 0
+        self._login1_connection: Gio.DBusConnection | None = None
 
         saved_config = load_saved_config()
         server_row, self.server_entry = _entry_row("Remote server IP address")
@@ -214,6 +245,8 @@ class SshVpnWindow(Adw.ApplicationWindow):
         root.append(content)
         self.set_content(root)
         self._set_busy(False)
+        self._subscribe_sleep_signal()
+        GLib.idle_add(self._sync_existing_tunnel)
 
     def open_routing_editor(self) -> None:
         RoutingEditorWindow(self).present()
@@ -226,7 +259,9 @@ class SshVpnWindow(Adw.ApplicationWindow):
         else:
             self._set_status("Routing rules saved. They will be used on the next connection.")
 
-    def _on_connect_clicked(self, _button: Gtk.Button) -> None:
+    def _on_connect_clicked(self, _button: Gtk.Button | None) -> None:
+        if _button is not None:
+            self._auto_reconnects = 0
         server = self.server_entry.get_text().strip()
         login = self.login_entry.get_text().strip()
         password = self.password_entry.get_text()
@@ -382,28 +417,39 @@ class SshVpnWindow(Adw.ApplicationWindow):
             self._suppress_toggle = False
         self.ovpn_row.set_sensitive(not self.busy)
 
-    def _run_helper(self, args: list[str], *, password: str | None, busy_text: str) -> None:
+    def _run_helper(self, args: list[str], *, password: str | None, busy_text: str, action: str | None = None) -> None:
         self._set_busy(True)
         self._set_status(busy_text)
+        command_name = action or args[0]
 
         def worker() -> None:
             result = run_helper(args, password=password)
-            GLib.idle_add(self._handle_helper_result, args[0], result)
+            GLib.idle_add(self._handle_helper_result, command_name, result)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _handle_helper_result(self, command: str, result: dict) -> bool:
+        if command == "reap":
+            return self._handle_reap_result(result)
         if result.get("ok"):
             if command == "connect":
                 self.connected = True
+                self._dead_streak = 0
+                self._peer_watch_usable = False
+                self._start_watch()
             elif command == "disconnect":
                 self.connected = False
+                self._pending_reconnect = False
+                self._stop_watch()
             if command in {"routing-on", "routing-off", "cascade-on", "cascade-off"}:
                 self._save_config()
             self._pending_toggle = None
             messages = result.get("messages") or []
             self._set_status("Done." if not messages else "\n".join(messages[-5:]))
         else:
+            if command == "connect":
+                self.connected = False
+                self._stop_watch()
             if self._pending_toggle is not None:
                 name, previous_state = self._pending_toggle
                 switch = self.routing_switch if name == "routing" else self.cascade_switch
@@ -413,6 +459,206 @@ class SshVpnWindow(Adw.ApplicationWindow):
             self._set_status(result.get("error", "Unknown helper error"))
         self._set_busy(False)
         return False
+
+    def _handle_reap_result(self, result: dict) -> bool:
+        self._reaping = False
+        self.connected = False
+        self._stop_watch()
+        reconnect = self._pending_reconnect
+        self._pending_reconnect = False
+        if result.get("ok") and reconnect:
+            self._set_busy(False)
+            self._auto_reconnect()
+            return False
+        if result.get("ok"):
+            messages = result.get("messages") or []
+            detail = "\n".join(messages[-3:]) if messages else "Leftover tunnel state was removed."
+            self._set_status(detail)
+        else:
+            self._set_status(result.get("error", "Unable to clean up the dead tunnel"))
+        self._set_busy(False)
+        return False
+
+    def _sync_existing_tunnel(self) -> bool:
+        threading.Thread(target=self._sync_existing_tunnel_worker, daemon=True).start()
+        return False
+
+    def _sync_existing_tunnel_worker(self) -> None:
+        snapshot = inspect_tunnel()
+        GLib.idle_add(self._apply_startup_snapshot, snapshot)
+
+    def _apply_startup_snapshot(self, snapshot: TunnelSnapshot) -> bool:
+        if self.busy or self.connected:
+            return False
+        if snapshot.process_up:
+            self.connected = True
+            self._peer_watch_usable = snapshot.peer_reachable
+            self._start_watch()
+            self._set_status("Existing SSH tunnel is still up.")
+            self._set_busy(False)
+        elif snapshot.leftover:
+            self._reap_dead_tunnel(
+                snapshot,
+                reconnect=False,
+                reason="A previous tunnel is no longer healthy.",
+            )
+        return False
+
+    def _subscribe_sleep_signal(self) -> None:
+        try:
+            connection = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            self._sleep_subscription = connection.signal_subscribe(
+                "org.freedesktop.login1",
+                "org.freedesktop.login1.Manager",
+                "PrepareForSleep",
+                "/org/freedesktop/login1",
+                None,
+                Gio.DBusSignalFlags.NONE,
+                self._on_prepare_for_sleep,
+            )
+            self._login1_connection = connection
+        except Exception:
+            self._sleep_subscription = 0
+            self._login1_connection = None
+
+    def _on_prepare_for_sleep(
+        self,
+        _connection: Gio.DBusConnection,
+        _sender: str | None,
+        _object_path: str,
+        _interface: str,
+        _signal: str,
+        parameters: GLib.Variant,
+    ) -> None:
+        going_to_sleep = bool(parameters.unpack()[0])
+        if going_to_sleep:
+            return
+        self._auto_reconnects = 0
+        GLib.idle_add(self._on_system_resumed)
+
+    def _on_system_resumed(self) -> bool:
+        if not self.connected or self.busy or self._reaping or self._resume_probe_active:
+            return False
+        self._resume_probe_active = True
+        self._set_status("Computer woke up. Checking the tunnel...")
+        threading.Thread(target=self._resume_probe_worker, daemon=True).start()
+        return False
+
+    def _resume_probe_worker(self) -> None:
+        snapshot = inspect_tunnel()
+        network: bool | None = None
+        for attempt in range(8):
+            if attempt:
+                time.sleep(1.5)
+            snapshot = inspect_tunnel()
+            if snapshot.alive:
+                break
+            network = network_is_available()
+            if network is False:
+                continue
+            if attempt >= 2:
+                break
+        GLib.idle_add(self._finish_resume_probe, snapshot, network)
+
+    def _finish_resume_probe(self, snapshot: TunnelSnapshot, network: bool | None) -> bool:
+        self._resume_probe_active = False
+        if not self.connected or self.busy or self._reaping:
+            return False
+        if self._snapshot_is_healthy(snapshot, require_peer=True):
+            self._dead_streak = 0
+            self._set_status("Tunnel is still up after wake.")
+            return False
+        if network is False:
+            self._set_status("Computer woke up. Waiting for the network before checking the tunnel...")
+            return False
+        self._reap_dead_tunnel(
+            snapshot,
+            reconnect=True,
+            reason="Tunnel died after the computer woke from sleep.",
+        )
+        return False
+
+    def _start_watch(self) -> None:
+        if self._watch_source is not None:
+            return
+        self._dead_streak = 0
+        self._last_wall = time.time()
+        self._watch_source = GLib.timeout_add(WATCH_INTERVAL_MS, self._on_watch_tick)
+
+    def _stop_watch(self) -> None:
+        if self._watch_source is not None:
+            GLib.source_remove(self._watch_source)
+            self._watch_source = None
+        self._dead_streak = 0
+        self._watch_in_flight = False
+        self._peer_watch_usable = False
+
+    def _on_watch_tick(self) -> bool:
+        now = time.time()
+        elapsed = now - self._last_wall
+        self._last_wall = now
+        if wall_clock_implies_sleep(elapsed):
+            self._auto_reconnects = 0
+            self._on_system_resumed()
+            return True
+        if not self.connected or self.busy or self._reaping or self._resume_probe_active or self._watch_in_flight:
+            return True
+        self._watch_in_flight = True
+        threading.Thread(target=self._watch_worker, daemon=True).start()
+        return True
+
+    def _watch_worker(self) -> None:
+        snapshot = inspect_tunnel()
+        GLib.idle_add(self._handle_watch_snapshot, snapshot)
+
+    def _handle_watch_snapshot(self, snapshot: TunnelSnapshot) -> bool:
+        self._watch_in_flight = False
+        if not self.connected or self.busy or self._reaping or self._resume_probe_active:
+            return False
+        if self._snapshot_is_healthy(snapshot, require_peer=True):
+            self._dead_streak = 0
+            return False
+        if network_is_available() is False:
+            return False
+        self._dead_streak += 1
+        if self._dead_streak >= DEAD_STREAK_LIMIT:
+            self._reap_dead_tunnel(
+                snapshot,
+                reconnect=True,
+                reason="The SSH tunnel died.",
+            )
+        return False
+
+    def _snapshot_is_healthy(self, snapshot: TunnelSnapshot, *, require_peer: bool) -> bool:
+        healthy, self._peer_watch_usable = evaluate_tunnel_health(
+            snapshot,
+            require_peer=require_peer,
+            peer_watch_usable=self._peer_watch_usable,
+        )
+        return healthy
+
+    def _reap_dead_tunnel(self, snapshot: TunnelSnapshot, *, reconnect: bool, reason: str) -> None:
+        if self.busy or self._reaping:
+            return
+        self._reaping = True
+        self._pending_reconnect = reconnect
+        args = ["disconnect", "--local-only"]
+        server = self.server_entry.get_text().strip()
+        if server:
+            args.extend(["--server", server])
+        self._run_helper(
+            args,
+            password=None,
+            busy_text=f"{reason} Cleaning leftover routes ({snapshot.reason})...",
+            action="reap",
+        )
+
+    def _auto_reconnect(self) -> None:
+        if self._auto_reconnects >= MAX_AUTO_RECONNECTS:
+            self._set_status("Tunnel died. Automatic reconnect already failed. Click Connect to try again.")
+            return
+        self._auto_reconnects += 1
+        self._on_connect_clicked(None)
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
@@ -496,6 +742,10 @@ def _helper_timeout(args: list[str]) -> int:
         return 180
     if command == "diagnose":
         return 30
+    if command == "status":
+        return 10
+    if command == "disconnect" and "--local-only" in args:
+        return 20
     if command == "cascade-on" or (command == "connect" and "--ovpn-file" in args):
         return 360
     return 90

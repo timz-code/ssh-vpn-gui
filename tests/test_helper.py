@@ -142,6 +142,99 @@ def test_save_routing_validates_and_atomically_replaces_file(
     assert not (tmp_path / ".routing.cfg.tmp").exists()
 
 
+def test_status_reports_structured_liveness(monkeypatch, capsys) -> None:
+    from ssh_vpn_gui.tunnel_watch import TunnelSnapshot
+
+    monkeypatch.setattr(
+        helper,
+        "inspect_tunnel",
+        lambda: TunnelSnapshot(daemon_alive=True, tun_present=True, peer_reachable=False),
+    )
+
+    result = helper.main(["status"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["ok"] is True
+    assert payload["status"] == {
+        "alive": False,
+        "process_up": True,
+        "daemon_alive": True,
+        "tun_present": True,
+        "peer_reachable": False,
+    }
+    assert any("unreachable" in line for line in payload["messages"])
+
+
+def test_disconnect_local_only_skips_remote_cleanup(monkeypatch, tmp_path, capsys) -> None:
+    routing_file = tmp_path / "routing.cfg"
+    routing_file.write_text("default: proxy\n", encoding="utf-8")
+    remote_calls = []
+    monkeypatch.setattr(helper, "require_root", lambda: None)
+    monkeypatch.setattr(helper, "stop_dns_proxy", lambda **_kwargs: ["dns stopped"])
+    monkeypatch.setattr(helper, "stop_tunnel", lambda **_kwargs: ["tunnel stopped"])
+    monkeypatch.setattr(
+        helper,
+        "cleanup_remote",
+        lambda *_args, **_kwargs: remote_calls.append(True) or ["remote cleaned"],
+    )
+
+    result = helper.main(
+        [
+            "disconnect",
+            "--local-only",
+            "--server",
+            "203.0.113.10",
+            "--login",
+            "root",
+            "--password",
+            "secret",
+            "--routing-file",
+            str(routing_file),
+            "--dry-run",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["ok"] is True
+    assert remote_calls == []
+    assert "remote cleaned" not in payload["messages"]
+
+
+def test_disconnect_succeeds_when_remote_cleanup_fails(monkeypatch, tmp_path, capsys) -> None:
+    routing_file = tmp_path / "routing.cfg"
+    routing_file.write_text("default: proxy\n", encoding="utf-8")
+    monkeypatch.setattr(helper, "require_root", lambda: None)
+    monkeypatch.setattr(helper, "stop_dns_proxy", lambda **_kwargs: ["dns stopped"])
+    monkeypatch.setattr(helper, "stop_tunnel", lambda **_kwargs: ["tunnel stopped"])
+
+    def fail_remote(*_args, **_kwargs):
+        raise RuntimeError("Network is unreachable")
+
+    monkeypatch.setattr(helper, "cleanup_remote", fail_remote)
+
+    result = helper.main(
+        [
+            "disconnect",
+            "--server",
+            "203.0.113.10",
+            "--login",
+            "root",
+            "--password",
+            "secret",
+            "--routing-file",
+            str(routing_file),
+            "--dry-run",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["ok"] is True
+    assert any("remote cleanup skipped" in line for line in payload["messages"])
+
+
 def test_save_routing_rejects_invalid_rules_without_overwriting(
     monkeypatch, tmp_path, capsys
 ) -> None:

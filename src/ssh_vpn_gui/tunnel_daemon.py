@@ -6,8 +6,9 @@ import time
 
 import pexpect
 
-from .system import remote_setup_script
 from .ssh_tunnel import _ssh_command
+from .system import remote_setup_script
+from .tunnel_watch import is_tun_peer_reachable, should_drop_unresponsive_peer
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -67,8 +68,19 @@ def main(argv: list[str] | None = None) -> int:
                 print("Timed out waiting for SSH tunnel", file=sys.stderr, flush=True)
                 return 1
 
+        ready_at = time.monotonic()
+        peer_failures = 0
         while child.isalive():
-            time.sleep(1)
+            if is_tun_peer_reachable(timeout=1.5):
+                peer_failures = 0
+            else:
+                peer_failures += 1
+                elapsed = time.monotonic() - ready_at
+                if should_drop_unresponsive_peer(failures=peer_failures, elapsed_seconds=elapsed):
+                    print("Tunnel peer stopped responding", file=sys.stderr, flush=True)
+                    child.close(force=True)
+                    return 1
+            time.sleep(2)
         return child.exitstatus or 0
     finally:
         child.close(force=True)

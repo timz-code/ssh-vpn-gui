@@ -30,3 +30,12 @@ def test_save_config_persists_checkbox_preferences(monkeypatch, tmp_path) -> Non
 def test_cascade_on_uses_install_timeout() -> None:
     assert app._helper_timeout(["cascade-on"]) == 360
     assert app._helper_timeout(["cascade-off"]) == 90
+    assert app._helper_timeout(["status"]) == 10
+    assert app._helper_timeout(["disconnect", "--local-only"]) == 20
+    assert app._helper_timeout(["disconnect"]) == 90
+
+
+def test_wall_clock_gap_detects_sleep() -> None:
+    assert app.wall_clock_implies_sleep(5) is False
+    assert app.wall_clock_implies_sleep(24) is False
+    assert app.wall_clock_implies_sleep(26) is True

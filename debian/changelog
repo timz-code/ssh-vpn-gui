@@ -1,3 +1,12 @@
+ssh-vpn-gui (0.2.13) unstable; urgency=medium
+
+  * Detect a dead SSH tunnel after suspend/resume and while the GUI is
+    running, clean leftover routes, update the window, and reconnect.
+  * Keep disconnect successful when the remote server cannot be reached
+    for cleanup.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Thu, 27 Aug 2026 23:50:00 +0300
+
 ssh-vpn-gui (0.2.12) unstable; urgency=medium
 
   * Route DNS-over-TLS queries through the SSH tunnel for domains classified
