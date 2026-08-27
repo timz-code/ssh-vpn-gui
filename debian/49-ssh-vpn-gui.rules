@@ -1,0 +1,17 @@
+// Allow a local administrator to run the SSH VPN helper without a password
+// after the package has been installed. Installing the .deb is the one-time
+// authorization. Restricts the action to an active local session in sudo,
+// admin, or wheel.
+polkit.addRule(function(action, subject) {
+    if (action.id !== "com.ssh-vpn-gui.helper") {
+        return;
+    }
+    if (!subject.local || !subject.active) {
+        return;
+    }
+    if (subject.isInGroup("sudo") ||
+        subject.isInGroup("admin") ||
+        subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+    }
+});

@@ -1,3 +1,11 @@
+ssh-vpn-gui (0.2.14) unstable; urgency=medium
+
+  * Allow sudo/admin/wheel users to run the privileged helper without a
+    password after package installation. The apt/polkit prompt at install
+    is the one-time authorization.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Thu, 27 Aug 2026 23:59:00 +0300
+
 ssh-vpn-gui (0.2.13) unstable; urgency=medium
 
   * Detect a dead SSH tunnel after suspend/resume and while the GUI is

@@ -199,25 +199,37 @@ Notes:
 
 ## Local Privilege Prompt
 
-The GUI uses Polkit (`pkexec`) because local TUN, routing and firewall changes
-require root privileges. This local administrator prompt is separate from the
-remote server password entered in the application.
+TUN, routing and firewall changes need root. That local administrator
+check is separate from the remote SSH password typed in the window.
 
-For a single-user machine, an optional repository script can allow the current
-user to run only `/usr/bin/ssh-vpn-helper` through passwordless sudo:
+The Debian package installs a Polkit rule so members of `sudo`, `admin`
+or `wheel` in an active local session can run `/usr/bin/ssh-vpn-helper`
+without a password. Installing the package (which already requires
+administrator rights) is the authorization. Connect and Disconnect then
+stay silent.
+
+To revoke that:
+
+```bash
+sudo rm /usr/share/polkit-1/rules.d/49-ssh-vpn-gui.rules
+```
+
+From a source tree, the same exception can be limited to the current
+user:
+
+```bash
+./scripts/install-polkit-rule.sh
+```
+
+Or via passwordless sudo for only the helper:
 
 ```bash
 ./scripts/install-sudoers-rule.sh
 ```
 
-The GUI detects that rule and uses `sudo -n`. Remove it with:
-
-```bash
-./scripts/uninstall-sudoers-rule.sh
-```
-
-These scripts are available in the source repository, not in the Debian
-package.
+The GUI uses `sudo -n` when `/etc/sudoers.d/ssh-vpn-gui` exists, and
+`pkexec` otherwise. Remove the sudoers rule with
+`./scripts/uninstall-sudoers-rule.sh`.
 
 ## Troubleshooting
 

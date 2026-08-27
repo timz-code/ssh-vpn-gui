@@ -2,3 +2,4 @@ routing.cfg etc/ssh-vpn-gui/
 ssh-vpn-gui.desktop usr/share/applications/
 assets/dev.cursor.SshVpnGui.png usr/share/icons/hicolor/512x512/apps/
 debian/com.ssh-vpn-gui.helper.policy usr/share/polkit-1/actions/
+debian/49-ssh-vpn-gui.rules usr/share/polkit-1/rules.d/
