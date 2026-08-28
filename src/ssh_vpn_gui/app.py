@@ -16,6 +16,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 from .paths import SUDOERS_RULE, SYSTEM_HELPER, SYSTEM_ROUTING_FILE
+from .system import OVPN_HELPER_TIMEOUT_SECONDS
 from .tunnel_watch import TunnelSnapshot, evaluate_tunnel_health, inspect_tunnel
 
 
@@ -30,6 +31,17 @@ MAX_AUTO_RECONNECTS = 1
 
 def wall_clock_implies_sleep(elapsed_seconds: float) -> bool:
     return elapsed_seconds > WALL_SLEEP_GAP_SECONDS
+
+
+def disconnect_args_for_reap(*, server: str, login: str, password: str) -> tuple[list[str], str | None]:
+    args = ["disconnect"]
+    if server and login and password:
+        args.extend(["--server", server, "--login", login])
+        return args, password
+    args.append("--local-only")
+    if server:
+        args.extend(["--server", server])
+    return args, None
 
 
 def network_is_available() -> bool | None:
@@ -280,7 +292,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
             args.append("--no-routing")
         if cascade:
             args.extend(["--ovpn-file", self.ovpn_path])
-            busy_text = "Connecting (preparing OpenVPN cascade; first setup may take a minute)..."
+            busy_text = "Connecting..."
         else:
             busy_text = "Connecting..."
         self._run_helper(args, password=password, busy_text=busy_text)
@@ -404,7 +416,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
         if replacing:
             busy_text = "Replacing the remote OpenVPN configuration..."
         elif enabled:
-            busy_text = "Starting OpenVPN cascade on the remote server..."
+            busy_text = "Starting cascade..."
         else:
             busy_text = "Stopping OpenVPN cascade on the remote server..."
         self._run_helper(args, password=password, busy_text=busy_text)
@@ -423,7 +435,11 @@ class SshVpnWindow(Adw.ApplicationWindow):
         command_name = action or args[0]
 
         def worker() -> None:
-            result = run_helper(args, password=password)
+            result = run_helper(
+                args,
+                password=password,
+                on_progress=lambda message: GLib.idle_add(self._set_status, message),
+            )
             GLib.idle_add(self._handle_helper_result, command_name, result)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -642,16 +658,18 @@ class SshVpnWindow(Adw.ApplicationWindow):
             return
         self._reaping = True
         self._pending_reconnect = reconnect
-        args = ["disconnect", "--local-only"]
-        server = self.server_entry.get_text().strip()
-        if server:
-            args.extend(["--server", server])
-        self._run_helper(
-            args,
-            password=None,
-            busy_text=f"{reason} Cleaning leftover routes ({snapshot.reason})...",
-            action="reap",
+        args, password = disconnect_args_for_reap(
+            server=self.server_entry.get_text().strip(),
+            login=self.login_entry.get_text().strip(),
+            password=self.password_entry.get_text(),
         )
+        remote = password is not None
+        busy_text = (
+            f"{reason} Cleaning leftover routes and remote OpenVPN ({snapshot.reason})..."
+            if remote
+            else f"{reason} Cleaning leftover routes ({snapshot.reason})..."
+        )
+        self._run_helper(args, password=password, busy_text=busy_text, action="reap")
 
     def _auto_reconnect(self) -> None:
         if self._auto_reconnects >= MAX_AUTO_RECONNECTS:
@@ -696,7 +714,13 @@ class SshVpnWindow(Adw.ApplicationWindow):
         return False
 
 
-def run_helper(args: list[str], *, password: str | None, content: str | None = None) -> dict:
+def run_helper(
+    args: list[str],
+    *,
+    password: str | None,
+    content: str | None = None,
+    on_progress=None,
+) -> dict:
     command = [*_privileged_helper_command(), *args, "--routing-file", str(SYSTEM_ROUTING_FILE)]
     input_text = None
     if password and content is not None:
@@ -709,30 +733,59 @@ def run_helper(args: list[str], *, password: str | None, content: str | None = N
         input_text = content
 
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             command,
-            input=input_text,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            capture_output=True,
-            check=False,
-            timeout=_helper_timeout(args),
         )
     except FileNotFoundError as exc:
         return {"ok": False, "error": f"Missing executable: {exc.filename}"}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "Helper timed out. Check SSH, DNS-over-TLS, or GitHub access for routing data."}
 
-    output = completed.stdout.strip()
-    stderr = completed.stderr.strip()
+    stderr_chunks: list[str] = []
+    stdout_chunks: list[str] = []
+
+    def read_stderr() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_chunks.append(line)
+            prefix = "SSH_VPN_GUI_PROGRESS "
+            if on_progress is not None and line.startswith(prefix):
+                on_progress(line[len(prefix) :].rstrip("\n"))
+
+    def read_stdout() -> None:
+        assert proc.stdout is not None
+        stdout_chunks.append(proc.stdout.read())
+
+    err_thread = threading.Thread(target=read_stderr, daemon=True)
+    out_thread = threading.Thread(target=read_stdout, daemon=True)
+    err_thread.start()
+    out_thread.start()
+    if proc.stdin is not None:
+        if input_text is not None:
+            proc.stdin.write(input_text)
+        proc.stdin.close()
+    try:
+        proc.wait(timeout=_helper_timeout(args))
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        return {"ok": False, "error": "Helper timed out. Check SSH, DNS-over-TLS, or GitHub access for routing data."}
+    out_thread.join(timeout=1)
+    err_thread.join(timeout=1)
+
+    output = (stdout_chunks[0] if stdout_chunks else "").strip()
+    stderr = "".join(stderr_chunks).strip()
     try:
         payload = json.loads(output) if output else {}
     except json.JSONDecodeError:
         payload = {"ok": False, "error": output or stderr or "Helper returned invalid output"}
-    if completed.returncode != 0:
+    if proc.returncode != 0:
         if not payload.get("ok", False):
-            payload.setdefault("error", stderr or output or f"Helper exited with {completed.returncode}")
+            payload.setdefault("error", stderr or output or f"Helper exited with {proc.returncode}")
         else:
-            payload = {"ok": False, "error": stderr or f"Helper exited with {completed.returncode}"}
+            payload = {"ok": False, "error": stderr or f"Helper exited with {proc.returncode}"}
     return payload
 
 
@@ -747,7 +800,7 @@ def _helper_timeout(args: list[str]) -> int:
     if command == "disconnect" and "--local-only" in args:
         return 20
     if command == "cascade-on" or (command == "connect" and "--ovpn-file" in args):
-        return 360
+        return OVPN_HELPER_TIMEOUT_SECONDS
     return 90
 
 

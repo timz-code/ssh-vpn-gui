@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import subprocess
 
 from ssh_vpn_gui import helper
@@ -43,7 +44,7 @@ def test_cascade_off_dry_run_only_stops_remote_openvpn(tmp_path, capsys) -> None
     payload = json.loads(capsys.readouterr().out)
     assert result == 0
     assert payload["ok"] is True
-    assert "ip rule del from 10.255.3.0/30 table 2124" in payload["messages"][0]
+    assert "ip rule del table 2124" in payload["messages"][0]
     assert "ip addr flush dev tun3" not in payload["messages"][0]
 
 
@@ -71,8 +72,18 @@ def test_cascade_on_dry_run_uploads_selected_config(tmp_path, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert result == 0
     assert payload["ok"] is True
-    assert "openvpn --config /etc/ssh-vpn-gui/client.ovpn" in payload["messages"][0]
-    assert "-w 3:3" not in payload["messages"][0]
+    assert "--config /etc/ssh-vpn-gui/client.ovpn" in payload["messages"][0]
+    assert "SSH_VPN_OVPN_REAP_BEFORE_START" in payload["messages"][0]
+    assert payload["messages"][0].index("SSH_VPN_OVPN_REAP_BEFORE_START") < payload[
+        "messages"
+    ][0].index("--daemon ssh-vpn-gui-ovpn")
+    assert "seq 1 90" in payload["messages"][0]
+    assert "--connect-timeout 8" in payload["messages"][0]
+    assert "--connect-retry-max 1" in payload["messages"][0]
+    assert "openvpn failed to connect to the VPN server" in payload["messages"][0]
+    assert "SSH_VPN_REMOTE_OVPN" in payload["messages"][0]
+    assert '--dev "$ovpn_dev"' in payload["messages"][0]
+    assert not re.search(r"-w \d+:\d+", payload["messages"][0])
 
 
 def test_cascade_on_rolls_back_when_connectivity_check_fails(
@@ -259,7 +270,7 @@ def test_disconnect_restores_local_routing_without_routing_cfg(monkeypatch, tmp_
     assert "ip route flush table 2023" in payload["messages"]
     assert "ip route del 0.0.0.0/1" in payload["messages"]
     assert "ip route del 128.0.0.0/1" in payload["messages"]
-    assert "delete routes using tun3" in payload["messages"]
+    assert "delete routes using claimed tuns" in payload["messages"]
 
 
 def test_save_routing_rejects_invalid_rules_without_overwriting(

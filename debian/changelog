@@ -1,3 +1,78 @@
+ssh-vpn-gui (0.2.23) unstable; urgency=medium
+
+  * Stop the GUI watchdog from declaring a live tunnel dead. tunnel.env
+    was 0600 root-only, so the unprivileged watch could not see which tun
+    we claimed and killed a working SSH session.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 09:30:00 +0300
+
+ssh-vpn-gui (0.2.22) unstable; urgency=medium
+
+  * Pick a free local tun, a free remote tun, and a free 10.255.N.0/30
+    instead of assuming tun3 / 10.255.3.1 are ours. Persist the binding
+    in /run/ssh-vpn-gui/tunnel.env.
+  * Cascade OpenVPN takes the first free ovpnN on the VPS and is reaped
+    by config path, not by a hardcoded ovpn0.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 10:00:00 +0300
+
+ssh-vpn-gui (0.2.21) unstable; urgency=medium
+
+  * Wait 90s for ovpn0 to get an address. AUTH_FAILED and other hard
+    errors still abort the wait immediately.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 09:00:00 +0300
+
+ssh-vpn-gui (0.2.20) unstable; urgency=medium
+
+  * Show live status while the remote server installs OpenVPN packages
+    instead of sitting on a single "can take several minutes" line.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 08:00:00 +0300
+
+ssh-vpn-gui (0.2.19) unstable; urgency=medium
+
+  * Wait up to ten minutes for the first remote OpenVPN package install.
+    apt-get update/install was outliving the 150s SSH timeout, so the
+    helper aborted while the server was still installing packages.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 07:52:00 +0300
+
+ssh-vpn-gui (0.2.18) unstable; urgency=medium
+
+  * Reap every managed remote OpenVPN client on stop, not only the last
+    pid-file entry. Failed cascade attempts were leaving a pack of daemons.
+  * After a dead tunnel, disconnect also SSH-cleans the VPS so leftover
+    OpenVPN clients die when the VPN is no longer needed.
+  * Connect with OpenVPN enabled inspects the VPS for our leftover clients
+    (including daemons renamed ssh-vpn-gui-ovpn) and reaps them before
+    starting a new cascade.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 00:24:00 +0300
+
+ssh-vpn-gui (0.2.17) unstable; urgency=medium
+
+  * Stop leftover remote OpenVPN processes by PID, not only the pid file.
+  * Cap OpenVPN DNS retries (resolv-retry 3). Infinite resolve before
+    --daemon was what kept "Starting OpenVPN cascade..." on screen.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 00:20:00 +0300
+
+ssh-vpn-gui (0.2.16) unstable; urgency=medium
+
+  * Set OpenVPN connect-timeout and a single retry on the remote server so
+    a black-hole VPN fails there. The local helper no longer aborts first
+    and leaves a retrying OpenVPN daemon behind.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 00:14:00 +0300
+
+ssh-vpn-gui (0.2.15) unstable; urgency=medium
+
+  * Fail faster when the remote OpenVPN client cannot reach the configured
+    VPN, instead of waiting up to a minute and a half for ovpn0.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 00:08:00 +0300
+
 ssh-vpn-gui (0.2.14) unstable; urgency=medium
 
   * Allow sudo/admin/wheel users to run the privileged helper without a

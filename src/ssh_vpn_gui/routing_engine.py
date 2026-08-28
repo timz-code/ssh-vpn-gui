@@ -6,13 +6,12 @@ import ipaddress
 from .routing_config import RoutingConfig
 from .system import (
     CommandRunner,
-    LOCAL_TUN,
-    LOCAL_TUN_ADDRESS,
     OLD_FORCED_ROUTES,
     PROXY_MARK,
     PROXY_TABLE,
     STATE_DIR,
     cleanup_tun_routes,
+    routing_binding,
 )
 
 NFT_TABLE = "ssh_vpn_gui"
@@ -32,7 +31,8 @@ class RoutingEngine:
         runner.write_file(NFT_CONFIG, self._nft_config())
         runner.write_file(PROXY_ROUTES_FILE, "")
         runner.run(["nft", "-f", str(NFT_CONFIG)])
-        runner.run(["ip", "route", "replace", "default", "dev", LOCAL_TUN, "src", LOCAL_TUN_ADDRESS, "table", PROXY_TABLE])
+        binding = routing_binding()
+        runner.run(["ip", "route", "replace", "default", "dev", binding.local_tun, "src", binding.local_address, "table", PROXY_TABLE])
         runner.run(["ip", "rule", "add", "fwmark", PROXY_MARK, "table", PROXY_TABLE, "priority", PROXY_TABLE], check=False)
 
     def stop(self, runner: CommandRunner) -> None:
@@ -55,6 +55,7 @@ class RoutingEngine:
     def _nft_config(self) -> str:
         direct_elements = ", ".join(str(network) for network in _direct_networks())
         mark_rules = "\n".join(f"    {rule}" for rule in self._mark_rules())
+        binding = routing_binding()
         return f"""
 table inet {NFT_TABLE} {{
   set direct4 {{
@@ -81,7 +82,7 @@ table inet {NFT_TABLE} {{
 
   chain snat_tun {{
     type nat hook postrouting priority srcnat; policy accept;
-    oifname "{LOCAL_TUN}" ip saddr != {LOCAL_TUN_ADDRESS} snat ip to {LOCAL_TUN_ADDRESS};
+    oifname "{binding.local_tun}" ip saddr != {binding.local_address} snat ip to {binding.local_address};
   }}
 }}
 """.strip() + "\n"
@@ -112,7 +113,8 @@ def add_resolved_ips(runner: CommandRunner, action: str, addresses: list[str], t
         if ip.version == 4:
             runner.run(["nft", "add", "element", "inet", NFT_TABLE, set_name, "{", str(ip), "timeout", timeout, "}"], check=False)
             if action == "proxy":
-                runner.run(["ip", "route", "replace", f"{ip}/32", "dev", LOCAL_TUN, "src", LOCAL_TUN_ADDRESS], check=False)
+                binding = routing_binding()
+                runner.run(["ip", "route", "replace", f"{ip}/32", "dev", binding.local_tun, "src", binding.local_address], check=False)
                 _record_proxy_route(runner, str(ip))
             else:
                 runner.run(["ip", "route", "del", f"{ip}/32"], check=False)

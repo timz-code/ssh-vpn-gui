@@ -20,7 +20,16 @@ from .ssh_tunnel import (
     stop_remote_ovpn,
     stop_tunnel,
 )
-from .system import CommandRunner, cleanup_legacy_singbox, cleanup_local_tun, preserve_server_route, require_root, setup_full_tunnel_routes, setup_local_tun
+from .system import (
+    CommandRunner,
+    cleanup_legacy_singbox,
+    cleanup_local_tun,
+    load_tunnel_state,
+    preserve_server_route,
+    require_root,
+    setup_full_tunnel_routes,
+    setup_local_tun,
+)
 from .tunnel_watch import inspect_tunnel
 
 PUBLIC_IP_URLS = (
@@ -58,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
             _require_password(password)
             messages.extend(_connect(args, config, routing_file, runner, password))
         elif args.command == "disconnect":
+            binding = None if args.dry_run else load_tunnel_state()
             messages.extend(stop_dns_proxy(dry_run=args.dry_run))
             messages.extend(stop_tunnel(dry_run=args.dry_run))
             reset_local_routing(runner)
@@ -71,7 +81,8 @@ def main(argv: list[str] | None = None) -> int:
                             args.login,
                             password,
                             dry_run=args.dry_run,
-                            timeout=12,
+                            timeout=25,
+                            binding=binding,
                         )
                     )
                 except Exception as exc:
@@ -107,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
                     password,
                     ovpn_b64,
                     dry_run=args.dry_run,
+                    on_progress=_gui_progress,
                 )
             )
             if not args.dry_run:
@@ -221,6 +233,10 @@ def _require_password(password: str | None) -> None:
         raise ValueError("root password is required")
 
 
+def _gui_progress(message: str) -> None:
+    print(f"SSH_VPN_GUI_PROGRESS {message}", file=sys.stderr, flush=True)
+
+
 def _print_result(*, ok: bool, messages: list[str], error: str | None = None, extra: dict | None = None) -> None:
     payload = {"ok": ok, "messages": messages}
     if error:
@@ -248,7 +264,16 @@ def _connect(args: argparse.Namespace, config, routing_file: Path, runner: Comma
     ovpn_b64 = _read_ovpn_b64(args.ovpn_file)
     try:
         _cleanup_before_connect(args, config, runner)
-        messages.extend(start_tunnel(args.server, args.login, password, dry_run=args.dry_run, ovpn_b64=ovpn_b64))
+        messages.extend(
+            start_tunnel(
+                args.server,
+                args.login,
+                password,
+                dry_run=args.dry_run,
+                ovpn_b64=ovpn_b64,
+                on_progress=_gui_progress,
+            )
+        )
         setup_local_tun(runner)
         preserve_server_route(runner, args.server)
         if not args.no_routing:
@@ -279,6 +304,7 @@ def _cleanup_before_connect(args: argparse.Namespace, config, runner: CommandRun
 def _rollback_after_failed_connect(args: argparse.Namespace, config, password: str) -> list[str]:
     runner = CommandRunner(dry_run=False)
     messages: list[str] = []
+    binding = load_tunnel_state()
     try:
         messages.extend(stop_dns_proxy(dry_run=False))
         messages.extend(stop_tunnel(dry_run=False))
@@ -290,7 +316,9 @@ def _rollback_after_failed_connect(args: argparse.Namespace, config, password: s
         messages.append(f"rollback error: {exc}")
     if args.server:
         try:
-            messages.extend(cleanup_remote(args.server, args.login, password, dry_run=False))
+            messages.extend(
+                cleanup_remote(args.server, args.login, password, dry_run=False, binding=binding)
+            )
         except Exception as exc:
             messages.append(f"remote rollback error: {exc}")
     return messages
@@ -327,8 +355,9 @@ def _curl_public_ip() -> str | None:
 
 def _diagnose(server: str | None) -> list[str]:
     messages = inspect_tunnel().messages()
+    binding = load_tunnel_state()
     commands = [
-        ["ip", "addr", "show", "tun3"],
+        ["ip", "addr", "show", binding.local_tun] if binding else ["ip", "-4", "addr", "show"],
         ["ip", "rule", "show"],
         ["ip", "route", "show", "table", "2023"],
         ["ip", "route", "get", "34.160.111.145"],

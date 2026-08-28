@@ -40,7 +40,8 @@ def test_routing_engine_sets_policy_route_for_marked_proxy_traffic() -> None:
 
     assert "ip route replace default dev tun3 src 10.255.3.1 table 2023" in runner.commands
     assert "ip rule add fwmark 2023 table 2023 priority 2023" in runner.commands
-    assert "delete routes using tun3" not in runner.commands
+    assert "delete routes using claimed tuns" not in runner.commands
+    assert not any(command.startswith("delete routes using tun") for command in runner.commands)
 
 
 def test_reset_local_routing_removes_overlays_without_touching_main_default() -> None:
@@ -53,6 +54,6 @@ def test_reset_local_routing_removes_overlays_without_touching_main_default() ->
     assert "ip route flush table 2023" in runner.commands
     assert "ip route del 0.0.0.0/1" in runner.commands
     assert "ip route del 128.0.0.0/1" in runner.commands
-    assert "delete routes using tun3" in runner.commands
+    assert "delete routes using claimed tuns" in runner.commands
     assert not any("ip route replace default" in command for command in runner.commands)
     assert not any(command.startswith("ip route add") for command in runner.commands)

@@ -1,6 +1,7 @@
 import subprocess
 
 from ssh_vpn_gui import ssh_tunnel
+from ssh_vpn_gui.system import TunnelBinding
 from ssh_vpn_gui.tunnel_watch import (
     TunnelSnapshot,
     evaluate_tunnel_health,
@@ -99,7 +100,49 @@ def test_inspect_tunnel_requires_reachable_peer(monkeypatch) -> None:
     assert "not responding" in snapshot.reason
 
 
+CLAIMED = TunnelBinding(
+    local_tun="tun7",
+    remote_tun="tun2",
+    local_address="10.255.9.1",
+    remote_address="10.255.9.2",
+    cidr="10.255.9.0/30",
+)
+
+
+def _claim_tunnel(monkeypatch, binding: TunnelBinding = CLAIMED) -> None:
+    monkeypatch.setattr("ssh_vpn_gui.tunnel_watch.system.load_tunnel_state", lambda: binding)
+
+
+def test_is_tun_present_without_binding_ignores_foreign_tuns(monkeypatch) -> None:
+    monkeypatch.setattr("ssh_vpn_gui.tunnel_watch.system.load_tunnel_state", lambda: None)
+    monkeypatch.setattr("ssh_vpn_gui.tunnel_watch.system.discover_local_binding", lambda: None)
+
+    assert is_tun_present() is False
+
+
+def test_watch_recovers_tun_when_state_file_is_unreadable(monkeypatch) -> None:
+    monkeypatch.setattr("ssh_vpn_gui.tunnel_watch.system.load_tunnel_state", lambda: None)
+    monkeypatch.setattr("ssh_vpn_gui.tunnel_watch.system.discover_local_binding", lambda: CLAIMED)
+    seen = []
+
+    class FakePath:
+        def __init__(self, path):
+            self.path = str(path)
+
+        def exists(self):
+            seen.append(self.path)
+            return self.path.endswith("/tun7/operstate")
+
+        def read_text(self, encoding="utf-8"):
+            return "up\n"
+
+    monkeypatch.setattr("ssh_vpn_gui.tunnel_watch.Path", FakePath)
+    assert is_tun_present() is True
+    assert any("tun7" in path for path in seen)
+
+
 def test_is_tun_present_reads_operstate(monkeypatch, tmp_path) -> None:
+    _claim_tunnel(monkeypatch)
     operstate = tmp_path / "operstate"
     operstate.write_text("up\n", encoding="utf-8")
     monkeypatch.setattr(
@@ -111,6 +154,7 @@ def test_is_tun_present_reads_operstate(monkeypatch, tmp_path) -> None:
 
 
 def test_is_tun_present_treats_point_to_point_unknown_as_up(monkeypatch, tmp_path) -> None:
+    _claim_tunnel(monkeypatch)
     operstate = tmp_path / "operstate"
     operstate.write_text("unknown\n", encoding="utf-8")
     monkeypatch.setattr(
@@ -122,6 +166,7 @@ def test_is_tun_present_treats_point_to_point_unknown_as_up(monkeypatch, tmp_pat
 
 
 def test_is_tun_peer_reachable_uses_tunnel_interface(monkeypatch) -> None:
+    _claim_tunnel(monkeypatch)
     seen = []
 
     def fake_run(command, **_kwargs):
@@ -133,11 +178,13 @@ def test_is_tun_peer_reachable_uses_tunnel_interface(monkeypatch) -> None:
     assert is_tun_peer_reachable() is True
     assert seen[0][:3] == ["ping", "-n", "-c"]
     assert "-I" in seen[0]
-    assert "tun3" in seen[0]
-    assert "10.255.3.2" in seen[0]
+    assert "tun7" in seen[0]
+    assert "10.255.9.2" in seen[0]
+    assert "tun3" not in seen[0]
 
 
 def test_is_tun_peer_reachable_false_on_timeout(monkeypatch) -> None:
+    _claim_tunnel(monkeypatch)
     def timeout_run(*_args, **_kwargs):
         raise subprocess.TimeoutExpired(cmd=["ping"], timeout=2)
 

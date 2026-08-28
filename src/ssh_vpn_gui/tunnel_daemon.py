@@ -7,7 +7,7 @@ import time
 import pexpect
 
 from .ssh_tunnel import _ssh_command
-from .system import remote_setup_script
+from .system import load_tunnel_state, remote_setup_script
 from .tunnel_watch import is_tun_peer_reachable, should_drop_unresponsive_peer
 
 
@@ -24,9 +24,15 @@ def main(argv: list[str] | None = None) -> int:
         print("missing password", file=sys.stderr)
         return 2
 
+    binding = load_tunnel_state()
+    if binding is None:
+        print("missing tunnel binding in /run/ssh-vpn-gui/tunnel.env", file=sys.stderr)
+        return 2
+
+    command = _ssh_command(server, login, remote_setup_script(binding), binding=binding)
     child = pexpect.spawn(
-        _ssh_command(server, login, remote_setup_script())[0],
-        _ssh_command(server, login, remote_setup_script())[1:],
+        command[0],
+        command[1:],
         encoding="utf-8",
         timeout=30,
         ignore_sighup=True,

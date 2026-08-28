@@ -36,8 +36,8 @@ class TunnelSnapshot:
         if not self.daemon_alive:
             return "SSH tunnel process is not running"
         if not self.tun_present:
-            return f"{system.LOCAL_TUN} is down"
-        return f"tunnel peer {system.REMOTE_TUN_ADDRESS} is not responding"
+            return f"{_watch_tun()} is down"
+        return f"tunnel peer {_watch_peer()} is not responding"
 
     def as_dict(self) -> dict[str, bool]:
         return {
@@ -51,9 +51,9 @@ class TunnelSnapshot:
     def messages(self) -> list[str]:
         return [
             f"tunnel daemon: {'alive' if self.daemon_alive else 'dead'}",
-            f"{system.LOCAL_TUN}: {'up' if self.tun_present else 'down'}",
+            f"{_watch_tun()}: {'up' if self.tun_present else 'down'}",
             (
-                f"peer {system.REMOTE_TUN_ADDRESS}: "
+                f"peer {_watch_peer()}: "
                 f"{'reachable' if self.peer_reachable else 'unreachable'}"
             ),
         ]
@@ -70,8 +70,25 @@ def inspect_tunnel(*, ping_timeout: float = 1.5) -> TunnelSnapshot:
     )
 
 
+def _watch_binding():
+    return system.load_tunnel_state() or system.discover_local_binding()
+
+
+def _watch_tun() -> str:
+    binding = _watch_binding()
+    return binding.local_tun if binding else "tun"
+
+
+def _watch_peer() -> str:
+    binding = _watch_binding()
+    return binding.remote_address if binding else "peer"
+
+
 def is_tun_present() -> bool:
-    path = Path(f"/sys/class/net/{system.LOCAL_TUN}/operstate")
+    binding = _watch_binding()
+    if binding is None:
+        return False
+    path = Path(f"/sys/class/net/{binding.local_tun}/operstate")
     if not path.exists():
         return False
     try:
@@ -82,6 +99,9 @@ def is_tun_present() -> bool:
 
 
 def is_tun_peer_reachable(*, timeout: float = 1.5) -> bool:
+    binding = _watch_binding()
+    if binding is None:
+        return False
     wait = max(1, int(timeout))
     try:
         completed = subprocess.run(
@@ -93,8 +113,8 @@ def is_tun_peer_reachable(*, timeout: float = 1.5) -> bool:
                 "-W",
                 str(wait),
                 "-I",
-                system.LOCAL_TUN,
-                system.REMOTE_TUN_ADDRESS,
+                binding.local_tun,
+                binding.remote_address,
             ],
             text=True,
             capture_output=True,
@@ -120,7 +140,7 @@ def evaluate_tunnel_health(
 
     Unprivileged ICMP can be blocked. Once a peer ping has succeeded, later
     peer failures are treated as a dead tunnel. Until then, the SSH daemon
-    and tun3 state are enough.
+    and the claimed tun state are enough.
     """
     usable = True if snapshot.peer_reachable else peer_watch_usable
     if not snapshot.process_up:
