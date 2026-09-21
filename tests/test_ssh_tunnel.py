@@ -76,6 +76,32 @@ def test_start_tunnel_timeout_terminates_daemon_before_collecting_stderr(monkeyp
     assert daemon.terminated
 
 
+def test_start_tunnel_records_server_as_underlay(monkeypatch, tmp_path) -> None:
+    saved: list[TunnelBinding] = []
+    daemon = HangingDaemon()
+    daemon.stdin = DummyStdin()
+
+    monkeypatch.setattr(ssh_tunnel, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(ssh_tunnel, "SSH_PID", tmp_path / "ssh.pid")
+    monkeypatch.setattr(ssh_tunnel, "ensure_data_dir", lambda: None)
+    monkeypatch.setattr(ssh_tunnel, "stop_tunnel", lambda dry_run=False: [])
+    monkeypatch.setattr(
+        ssh_tunnel,
+        "_run_password_ssh",
+        lambda command, password, **_kwargs: list(BOOTSTRAP_MESSAGES),
+    )
+    monkeypatch.setattr(ssh_tunnel, "allocate_tunnel_binding", lambda _output: CLAIMED)
+    monkeypatch.setattr(ssh_tunnel, "save_tunnel_state", saved.append)
+    monkeypatch.setattr(ssh_tunnel, "_wait_for_daemon_ready", lambda process, timeout: True)
+    monkeypatch.setattr(ssh_tunnel.subprocess, "Popen", lambda *_args, **_kwargs: daemon)
+
+    messages = ssh_tunnel.start_tunnel("192.168.50.2", "root", "secret")
+
+    assert saved[0].server == "192.168.50.2"
+    assert saved[0].local_tun == CLAIMED.local_tun
+    assert any("started ssh tunnel daemon" in line for line in messages)
+
+
 def test_start_tunnel_dry_run_bootstraps_before_tun() -> None:
     commands = ssh_tunnel.start_tunnel("203.0.113.10", "root", "secret", dry_run=True)
 
@@ -114,6 +140,7 @@ def test_start_tunnel_dry_run_inserts_ovpn_bootstrap_before_tun() -> None:
     assert "seq 1 90" in commands[1]
     assert "--resolv-retry 3" in commands[1]
     assert "--connect-timeout 8" in commands[1]
+    assert "--disable-dco" in commands[1]
     assert "--server-poll-timeout 8" in commands[1]
     assert "--connect-retry-max 1" in commands[1]
     assert "timeout 8 openvpn" not in commands[1]
@@ -202,12 +229,14 @@ def test_emit_ovpn_progress_reports_install_phase() -> None:
     ]
 
 
-def test_stop_remote_ovpn_only_removes_cascade_state() -> None:
+def test_stop_remote_ovpn_only_removes_cascade_state(monkeypatch) -> None:
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: None)
     commands = ssh_tunnel.stop_remote_ovpn(
         "203.0.113.10", "root", "secret", dry_run=True
     )
 
     assert len(commands) == 1
+    assert "ip rule del priority 2123" in commands[0]
     assert "ip rule del table 2124" in commands[0]
     assert "ip route flush table 2124" in commands[0]
     assert "conntrack -D -s 10.255.0.0/16" in commands[0]

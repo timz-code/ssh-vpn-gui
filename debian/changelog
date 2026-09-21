@@ -1,3 +1,71 @@
+ssh-vpn-gui (0.2.31) unstable; urgency=medium
+
+  * After eight failed reconnects keep trying every minute. Fail-closed
+    stays up until a session comes back or Exit and Restore.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Mon, 21 Sep 2026 09:10:00 +0300
+
+ssh-vpn-gui (0.2.30) unstable; urgency=medium
+
+  * When the SSH tunnel dies, keep direct routes and blackhole everything
+    else. Non-direct traffic must not fall back to the clearnet.
+  * Show Exit and Restore after a drop: restore system routing and quit.
+  * Retry automatic reconnect eight times, not once.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Wed, 09 Sep 2026 12:10:00 +0300
+
+ssh-vpn-gui (0.2.29) unstable; urgency=medium
+
+  * Give the main window and status log a bit more room.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 13:00:00 +0300
+
+ssh-vpn-gui (0.2.28) unstable; urgency=medium
+
+  * NAT laptop traffic with MASQUERADE again, not SNAT to the VPS WAN
+    IP. Cascade OpenVPN sends that traffic out ovpn; a frozen public
+    source is dropped on the VPN.
+  * Disable OpenVPN 2.7 DCO. It ignores --dev ovpnN and opens tun0,
+    which is the SSH tunnel.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 12:40:00 +0300
+
+ssh-vpn-gui (0.2.27) unstable; urgency=medium
+
+  * Force IPv4 forwarding on every VPS interface, not only ip_forward=1.
+    Cloud images leave enp*.forwarding=0, so tun->WAN is counted and
+    WAN->tun never appears on -o tun.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 12:25:00 +0300
+
+ssh-vpn-gui (0.2.26) unstable; urgency=medium
+
+  * Keep the SSH server IP on the underlay. DNS classification must not
+    install a tun /32 for that address or delete the WAN pin — that loop
+    killed the session after a few lookups.
+  * SNAT laptop traffic to the VPS WAN (or OpenVPN) address. Packets
+    leaving with src 10.255.N.1 were dropped on the way back.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 12:20:00 +0300
+
+ssh-vpn-gui (0.2.25) unstable; urgency=medium
+
+  * On the VPS, accept FORWARD for the SSH tun and clear rp_filter on
+    every interface. ufw/cloud images were dropping tunneled IPv4 so
+    the laptop saw a live tunnel and no internet.
+  * Reject outbound IPv6 except ICMPv6/localhost while routing is on.
+    The tunnel is IPv4-only; Happy Eyeballs otherwise bypasses or hangs.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 12:00:00 +0300
+
+ssh-vpn-gui (0.2.24) unstable; urgency=medium
+
+  * Keep SSH tun peer replies off the OpenVPN policy table. Cascade
+    was sending 10.255.N.2 pings into ovpn, so the local daemon thought
+    the tunnel was dead and tore it down.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 28 Aug 2026 10:10:00 +0300
+
 ssh-vpn-gui (0.2.23) unstable; urgency=medium
 
   * Stop the GUI watchdog from declaring a live tunnel dead. tunnel.env

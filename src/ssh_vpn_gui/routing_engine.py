@@ -11,7 +11,12 @@ from .system import (
     PROXY_TABLE,
     STATE_DIR,
     cleanup_tun_routes,
+    clear_fail_closed,
+    is_fail_closed,
+    mark_fail_closed,
+    preserve_server_route,
     routing_binding,
+    underlay_ips,
 )
 
 NFT_TABLE = "ssh_vpn_gui"
@@ -34,6 +39,14 @@ class RoutingEngine:
         binding = routing_binding()
         runner.run(["ip", "route", "replace", "default", "dev", binding.local_tun, "src", binding.local_address, "table", PROXY_TABLE])
         runner.run(["ip", "rule", "add", "fwmark", PROXY_MARK, "table", PROXY_TABLE, "priority", PROXY_TABLE], check=False)
+        if not runner.dry_run:
+            clear_fail_closed()
+        if self.server:
+            runner.run(
+                ["nft", "add", "element", "inet", NFT_TABLE, "direct4", "{", self.server, "}"],
+                check=False,
+            )
+            preserve_server_route(runner, self.server)
 
     def stop(self, runner: CommandRunner) -> None:
         reset_local_routing(runner)
@@ -42,9 +55,17 @@ class RoutingEngine:
         _reset_policy_routing(runner)
 
     def add_static_ip_rules(self, runner: CommandRunner) -> None:
+        protected = underlay_ips(self.server)
         for rule in self.config.rules:
             for matcher in rule.matchers:
                 if matcher.name != "ip_cidr":
+                    continue
+                if _cidr_covers(matcher.value, protected):
+                    runner.run(
+                        ["nft", "add", "element", "inet", NFT_TABLE, "direct4", "{", matcher.value, "}"],
+                        check=False,
+                    )
+                    preserve_server_route(runner, self.server)
                     continue
                 set_name = "direct4" if rule.action == "direct" else "proxy4"
                 runner.run(["nft", "add", "element", "inet", NFT_TABLE, set_name, "{", matcher.value, "}"], check=False)
@@ -53,7 +74,14 @@ class RoutingEngine:
         return [["nft", "-f", str(NFT_CONFIG)]]
 
     def _nft_config(self) -> str:
-        direct_elements = ", ".join(str(network) for network in _direct_networks())
+        networks = [str(network) for network in _direct_networks()]
+        try:
+            ipaddress.ip_address(self.server)
+        except ValueError:
+            pass
+        else:
+            networks.append(self.server)
+        direct_elements = ", ".join(networks)
         mark_rules = "\n".join(f"    {rule}" for rule in self._mark_rules())
         binding = routing_binding()
         return f"""
@@ -84,6 +112,13 @@ table inet {NFT_TABLE} {{
     type nat hook postrouting priority srcnat; policy accept;
     oifname "{binding.local_tun}" ip saddr != {binding.local_address} snat ip to {binding.local_address};
   }}
+
+  chain reject6_output {{
+    type filter hook output priority filter; policy accept;
+    meta l4proto icmpv6 accept;
+    ip6 daddr ::1 accept;
+    meta nfproto ipv6 reject;
+  }}
 }}
 """.strip() + "\n"
 
@@ -111,8 +146,17 @@ def add_resolved_ips(runner: CommandRunner, action: str, addresses: list[str], t
         except ValueError:
             continue
         if ip.version == 4:
+            if str(ip) in underlay_ips():
+                runner.run(
+                    ["nft", "add", "element", "inet", NFT_TABLE, "direct4", "{", str(ip), "}"],
+                    check=False,
+                )
+                preserve_server_route(runner, str(ip))
+                continue
             runner.run(["nft", "add", "element", "inet", NFT_TABLE, set_name, "{", str(ip), "timeout", timeout, "}"], check=False)
             if action == "proxy":
+                if is_fail_closed():
+                    continue
                 binding = routing_binding()
                 runner.run(["ip", "route", "replace", f"{ip}/32", "dev", binding.local_tun, "src", binding.local_address], check=False)
                 _record_proxy_route(runner, str(ip))
@@ -129,6 +173,35 @@ def reset_local_routing(runner: CommandRunner) -> None:
     """
     _reset_policy_routing(runner)
     cleanup_tun_routes(runner)
+    if not runner.dry_run:
+        clear_fail_closed()
+
+
+def apply_fail_closed(runner: CommandRunner, *, full_tunnel: bool = False, server: str | None = None) -> None:
+    """Keep direct traffic on the WAN. Send everything else into a hole.
+
+    Used when the SSH tunnel is dead: proxy/full-tunnel destinations must
+    not fall back to the clearnet. Exit and Restore (or a clean
+    disconnect) calls reset_local_routing() to undo this.
+    """
+    if runner.dry_run:
+        runner.commands.append("write fail-closed")
+    else:
+        mark_fail_closed()
+    if full_tunnel:
+        for route in OLD_FORCED_ROUTES:
+            runner.run(["ip", "route", "replace", "blackhole", route], check=False)
+    else:
+        runner.run(
+            ["ip", "route", "replace", "blackhole", "default", "table", PROXY_TABLE],
+            check=False,
+        )
+        runner.run(
+            ["ip", "rule", "add", "fwmark", PROXY_MARK, "table", PROXY_TABLE, "priority", PROXY_TABLE],
+            check=False,
+        )
+    if server:
+        preserve_server_route(runner, server)
 
 
 def _reset_policy_routing(runner: CommandRunner) -> None:
@@ -146,8 +219,9 @@ def cleanup_dynamic_proxy_routes(runner: CommandRunner) -> None:
         return
     if not PROXY_ROUTES_FILE.exists():
         return
+    protected = underlay_ips()
     for address in PROXY_ROUTES_FILE.read_text(encoding="utf-8").splitlines():
-        if address:
+        if address and address not in protected:
             runner.run(["ip", "route", "del", f"{address}/32"], check=False)
     PROXY_ROUTES_FILE.unlink(missing_ok=True)
 
@@ -161,6 +235,20 @@ def _record_proxy_route(runner: CommandRunner, address: str) -> None:
     if address not in existing:
         with PROXY_ROUTES_FILE.open("a", encoding="utf-8") as file:
             file.write(address + "\n")
+
+
+def _cidr_covers(value: str, addresses: set[str]) -> bool:
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return False
+    for address in addresses:
+        try:
+            if ipaddress.ip_address(address) in network:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _direct_networks() -> tuple[ipaddress.IPv4Network, ...]:

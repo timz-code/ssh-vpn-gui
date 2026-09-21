@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 import os
 from pathlib import Path
 import select
@@ -87,6 +88,7 @@ def start_tunnel(
         binding = allocate_tunnel_binding("\n".join(messages))
     except RuntimeError as exc:
         raise SshTunnelError(str(exc)) from exc
+    binding = replace(binding, server=server)
     save_tunnel_state(binding)
     messages.append(
         f"using {binding.local_tun} <-> {binding.remote_tun} "
@@ -415,6 +417,9 @@ def _wait_for_daemon_ready(process: subprocess.Popen[str], timeout: int) -> bool
         if not readable:
             continue
         line = process.stdout.readline()
-        if line.strip() == "SSH_VPN_READY":
+        stripped = line.strip()
+        if stripped.startswith("SSH_VPN_NAT "):
+            continue
+        if stripped == "SSH_VPN_READY":
             return True
     return False

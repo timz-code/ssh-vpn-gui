@@ -33,7 +33,14 @@ def test_reap_disconnect_uses_remote_cleanup_when_credentials_exist() -> None:
         login="root",
         password="secret",
     )
-    assert args == ["disconnect", "--server", "203.0.113.10", "--login", "root"]
+    assert args == [
+        "disconnect",
+        "--fail-closed",
+        "--server",
+        "203.0.113.10",
+        "--login",
+        "root",
+    ]
     assert password == "secret"
     assert "--local-only" not in args
 
@@ -44,8 +51,26 @@ def test_reap_disconnect_stays_local_without_password() -> None:
         login="root",
         password="",
     )
-    assert args == ["disconnect", "--local-only", "--server", "203.0.113.10"]
+    assert args == [
+        "disconnect",
+        "--fail-closed",
+        "--local-only",
+        "--server",
+        "203.0.113.10",
+    ]
     assert password is None
+
+
+def test_reap_disconnect_marks_full_tunnel_fail_closed() -> None:
+    args, password = app.disconnect_args_for_reap(
+        server="203.0.113.10",
+        login="root",
+        password="secret",
+        routing=False,
+    )
+    assert "--fail-closed" in args
+    assert "--no-routing" in args
+    assert password == "secret"
 
 
 def test_cascade_on_uses_install_timeout() -> None:
@@ -55,6 +80,15 @@ def test_cascade_on_uses_install_timeout() -> None:
     assert app._helper_timeout(["status"]) == 10
     assert app._helper_timeout(["disconnect", "--local-only"]) == 20
     assert app._helper_timeout(["disconnect"]) == 90
+
+
+def test_auto_reconnect_budget_is_more_than_one() -> None:
+    assert app.MAX_AUTO_RECONNECTS >= 8
+    assert app.SLOW_RECONNECT_INTERVAL_MS == 60_000
+    assert app.next_reconnect_delay_ms(0) is None
+    assert app.next_reconnect_delay_ms(7) is None
+    assert app.next_reconnect_delay_ms(8) == 60_000
+    assert app.next_reconnect_delay_ms(20) == 60_000
 
 
 def test_wall_clock_gap_detects_sleep() -> None:

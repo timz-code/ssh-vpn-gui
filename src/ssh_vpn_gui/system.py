@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import os
 from pathlib import Path
 import re
@@ -21,7 +21,11 @@ SINGBOX_PID = STATE_DIR / "sing-box.pid"
 
 OVPN_DEV = "ovpn0"
 OVPN_TABLE = "2124"
+# Looked up before OVPN_TABLE so replies to the SSH tun peer do not
+# follow the cascade default and vanish inside OpenVPN.
+OVPN_KEEP_TUN_PRIORITY = "2123"
 TUNNEL_STATE = STATE_DIR / "tunnel.env"
+FAIL_CLOSED_FLAG = STATE_DIR / "fail-closed"
 OVPN_CONFIG_PATH = "/etc/ssh-vpn-gui/client.ovpn"
 OVPN_PID_PATH = "/run/ssh-vpn-gui-ovpn.pid"
 OVPN_LOG_PATH = "/var/log/ssh-vpn-gui-ovpn.log"
@@ -49,6 +53,9 @@ class TunnelBinding:
     remote_address: str
     cidr: str
     ovpn_dev: str = ""
+    server: str = ""
+    underlay_via: str = ""
+    underlay_dev: str = ""
 
     @property
     def local_index(self) -> int:
@@ -127,6 +134,9 @@ def load_tunnel_state() -> TunnelBinding | None:
             remote_address=values["remote_address"],
             cidr=values["cidr"],
             ovpn_dev=values.get("ovpn_dev", ""),
+            server=values.get("server", ""),
+            underlay_via=values.get("underlay_via", ""),
+            underlay_dev=values.get("underlay_dev", ""),
         )
     except (OSError, KeyError, ValueError):
         return None
@@ -142,16 +152,37 @@ def save_tunnel_state(binding: TunnelBinding) -> None:
             f"remote_address={binding.remote_address}\n"
             f"cidr={binding.cidr}\n"
             f"ovpn_dev={binding.ovpn_dev}\n"
+            f"server={binding.server}\n"
+            f"underlay_via={binding.underlay_via}\n"
+            f"underlay_dev={binding.underlay_dev}\n"
         ),
         encoding="utf-8",
     )
     # The unprivileged GUI watchdog must be able to read this. The file
-    # only names the claimed tun and the 10.255.N.0/30 pair — no secrets.
+    # names the claimed tun, the 10.255.N.0/30 pair, and the SSH server
+    # underlay pin — no secrets.
     TUNNEL_STATE.chmod(0o644)
 
 
 def clear_tunnel_state() -> None:
     TUNNEL_STATE.unlink(missing_ok=True)
+
+
+def is_fail_closed() -> bool:
+    return FAIL_CLOSED_FLAG.exists()
+
+
+def mark_fail_closed() -> None:
+    ensure_state_dir()
+    FAIL_CLOSED_FLAG.write_text("1\n", encoding="utf-8")
+    try:
+        FAIL_CLOSED_FLAG.chmod(0o644)
+    except OSError:
+        pass
+
+
+def clear_fail_closed() -> None:
+    FAIL_CLOSED_FLAG.unlink(missing_ok=True)
 
 
 def routing_binding() -> TunnelBinding:
@@ -232,16 +263,7 @@ def update_tunnel_ovpn(ovpn_dev: str) -> None:
     binding = load_tunnel_state()
     if binding is None:
         return
-    save_tunnel_state(
-        TunnelBinding(
-            local_tun=binding.local_tun,
-            remote_tun=binding.remote_tun,
-            local_address=binding.local_address,
-            remote_address=binding.remote_address,
-            cidr=binding.cidr,
-            ovpn_dev=ovpn_dev,
-        )
-    )
+    save_tunnel_state(replace(binding, ovpn_dev=ovpn_dev))
 
 
 @dataclass
@@ -387,21 +409,66 @@ def setup_full_tunnel_routes(runner: CommandRunner, *, cleanup_first: bool = Tru
         )
 
 
+def underlay_ips(*extra: str) -> set[str]:
+    ips: set[str] = set()
+    state = load_tunnel_state()
+    if state and state.server:
+        ips.add(state.server)
+    for item in extra:
+        if item:
+            ips.add(item)
+    return ips
+
+
+def _route_via_dev(stdout: str) -> tuple[str, str]:
+    words = stdout.split()
+    via = words[words.index("via") + 1] if "via" in words else ""
+    dev = words[words.index("dev") + 1] if "dev" in words else ""
+    return via, dev
+
+
+def _lookup_underlay(runner: CommandRunner, server: str, avoid_dev: str) -> tuple[str, str]:
+    route = runner.run(["ip", "route", "get", server])
+    if route is not None:
+        via, dev = _route_via_dev(route.stdout)
+        if dev and dev != avoid_dev:
+            return via, dev
+    default = runner.run(["ip", "-4", "route", "show", "default"])
+    if default is None:
+        return "", ""
+    via, dev = _route_via_dev(default.stdout)
+    if dev == avoid_dev:
+        return "", ""
+    return via, dev
+
+
 def preserve_server_route(runner: CommandRunner, server: str) -> None:
+    if not server:
+        return
+    state = load_tunnel_state()
+    avoid_dev = state.local_tun if state else ""
+    via = state.underlay_via if state else ""
+    dev = state.underlay_dev if state else ""
+    if dev == avoid_dev:
+        via, dev = "", ""
     if runner.dry_run:
         runner.commands.append(f"ip route get {server}")
-        runner.commands.append(f"ip route replace {server}/32 dev <current-default-interface>")
+        runner.commands.append(
+            f"ip route replace {server}/32 via {via or '<gw>'} dev {dev or '<underlay>'}"
+        )
         return
 
-    route = runner.run(["ip", "route", "get", server])
-    if route is None:
-        return
-    route_words = route.stdout.split()
+    if not via and not dev:
+        via, dev = _lookup_underlay(runner, server, avoid_dev)
+        if state and (via or dev):
+            save_tunnel_state(replace(state, server=server, underlay_via=via, underlay_dev=dev))
     command = ["ip", "route", "replace", f"{server}/32"]
-    if "via" in route_words:
-        command.extend(["via", route_words[route_words.index("via") + 1]])
-    if "dev" in route_words:
-        command.extend(["dev", route_words[route_words.index("dev") + 1]])
+    if via:
+        command.extend(["via", via])
+    if dev:
+        command.extend(["dev", dev])
+    if len(command) == 4:
+        return
     runner.run(command)
 
 
@@ -567,6 +634,102 @@ echo SSH_VPN_BOOTSTRAP_READY
 """.replace("__SSH_VPN_OVPN_STOP__", _remote_ovpn_stop_snippet()).strip()
 
 
+def _remote_rp_filter_snippet() -> str:
+    return """
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+# IPv4 forward is AND(all, ingress-iface) on current kernels.
+# systemd-networkd / cloud-init set enp*.forwarding=0 after boot, so
+# tun->WAN is forwarded and WAN->tun is dropped. That is exactly
+# outbound FORWARD hits and zero -o tun.
+sysctl -w net.ipv4.conf.all.forwarding=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.forwarding=1 >/dev/null 2>&1 || true
+for fw in /proc/sys/net/ipv4/conf/*/forwarding; do
+  printf '1\\n' > "$fw" 2>/dev/null || true
+done
+# Linux applies max(all, iface). Clearing only 'all' leaves eth0=1 and
+# drops masqueraded replies on cloud images that ship strict rp_filter.
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+for rp in /proc/sys/net/ipv4/conf/*/rp_filter; do
+  printf '0\\n' > "$rp" 2>/dev/null || true
+done
+""".strip()
+
+
+def _remote_forward_accept_snippet(tun: str, cidr: str) -> str:
+    return f"""
+# ufw and many VPS images DROP FORWARD. NAT never sees the packets.
+if command -v nft >/dev/null 2>&1; then
+  nft add table ip ssh_vpn_gui 2>/dev/null || true
+  nft 'add chain ip ssh_vpn_gui forward {{ type filter hook forward priority -5; policy accept; }}' 2>/dev/null || true
+  nft add rule ip ssh_vpn_gui forward iifname "{tun}" accept 2>/dev/null || true
+  nft add rule ip ssh_vpn_gui forward oifname "{tun}" accept 2>/dev/null || true
+fi
+if command -v iptables >/dev/null 2>&1; then
+  iptables -C FORWARD -i {tun} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i {tun} -j ACCEPT
+  iptables -C FORWARD -o {tun} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o {tun} -j ACCEPT
+  iptables -C FORWARD -s {cidr} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -s {cidr} -j ACCEPT
+fi
+""".strip()
+
+
+def _remote_nat_snippet(tun: str, cidr: str) -> str:
+    return f"""
+modprobe nf_conntrack 2>/dev/null || true
+modprobe nf_nat 2>/dev/null || true
+modprobe xt_MASQUERADE 2>/dev/null || true
+modprobe iptable_nat 2>/dev/null || true
+{_remote_nat_cleanup_snippet(tun, cidr)}
+# MASQUERADE follows the egress iface. Frozen SNAT to the VPS WAN IP
+# breaks cascade: policy-routed packets leave ovpn with src=public.
+nat_ok=0
+if command -v nft >/dev/null 2>&1; then
+  nft add table ip ssh_vpn_gui 2>/dev/null || true
+  nft 'add chain ip ssh_vpn_gui postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}' 2>/dev/null || true
+  nft add rule ip ssh_vpn_gui postrouting ip saddr {cidr} oifname != "{tun}" masquerade 2>/dev/null || true
+  if nft list chain ip ssh_vpn_gui postrouting 2>/dev/null | grep -q masquerade; then
+    nat_ok=1
+  fi
+fi
+if command -v iptables >/dev/null 2>&1; then
+  iptables -t nat -C POSTROUTING -s {cidr} ! -o {tun} -j MASQUERADE 2>/dev/null || \\
+    iptables -t nat -A POSTROUTING -s {cidr} ! -o {tun} -j MASQUERADE
+  if iptables -t nat -C POSTROUTING -s {cidr} ! -o {tun} -j MASQUERADE 2>/dev/null; then
+    nat_ok=1
+  fi
+fi
+if [ "$nat_ok" -ne 1 ]; then
+  echo 'failed to install MASQUERADE for the SSH tun' >&2
+  exit 1
+fi
+wan_if=$(ip -4 route show default | awk '{{print $5; exit}}')
+echo SSH_VPN_NAT masquerade "$wan_if"
+""".strip()
+
+
+def _remote_nat_cleanup_snippet(tun: str, cidr: str) -> str:
+    _ = tun
+    return f"""
+if command -v iptables >/dev/null 2>&1; then
+  iptables -t nat -S POSTROUTING 2>/dev/null | sed -n 's/^-A POSTROUTING //p' | while read -r spec; do
+    case "$spec" in
+      *"-s {cidr}"*) iptables -t nat -D POSTROUTING $spec 2>/dev/null || true ;;
+    esac
+  done
+fi
+""".strip()
+
+
+def _remote_forward_cleanup_snippet(binding: TunnelBinding | None) -> str:
+    if binding is None:
+        return "iptables -D FORWARD -s 10.255.0.0/16 -j ACCEPT 2>/dev/null || true"
+    return (
+        f"iptables -D FORWARD -i {binding.remote_tun} -j ACCEPT 2>/dev/null || true; "
+        f"iptables -D FORWARD -o {binding.remote_tun} -j ACCEPT 2>/dev/null || true; "
+        f"iptables -D FORWARD -s {binding.cidr} -j ACCEPT 2>/dev/null || true"
+    )
+
+
 def remote_setup_script(binding: TunnelBinding | None = None) -> str:
     chosen = binding or routing_binding()
     return f"""
@@ -574,20 +737,14 @@ set -eu
 ip addr flush dev {chosen.remote_tun} || true
 ip addr add {chosen.remote_address} peer {chosen.local_address} dev {chosen.remote_tun} || true
 ip link set {chosen.remote_tun} up
-sysctl -w net.ipv4.ip_forward=1 >/dev/null
+{_remote_rp_filter_snippet()}
 sysctl -w net.ipv4.conf.{chosen.remote_tun}.rp_filter=0 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
-if command -v nft >/dev/null 2>&1; then
-  nft add table ip ssh_vpn_gui 2>/dev/null || true
-  nft 'add chain ip ssh_vpn_gui postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}' 2>/dev/null || true
-  nft add rule ip ssh_vpn_gui postrouting ip saddr {chosen.cidr} oifname != "{chosen.remote_tun}" masquerade 2>/dev/null || true
-fi
-if command -v iptables >/dev/null 2>&1; then
-  iptables -t nat -C POSTROUTING -s {chosen.cidr} ! -o {chosen.remote_tun} -j MASQUERADE 2>/dev/null || \\
-    iptables -t nat -A POSTROUTING -s {chosen.cidr} ! -o {chosen.remote_tun} -j MASQUERADE
-fi
+{_remote_nat_snippet(chosen.remote_tun, chosen.cidr)}
+{_remote_forward_accept_snippet(chosen.remote_tun, chosen.cidr)}
+ip rule add from {chosen.cidr} to {chosen.cidr} table main priority {OVPN_KEEP_TUN_PRIORITY} 2>/dev/null || true
+ip route replace {chosen.cidr} dev {chosen.remote_tun} table {OVPN_TABLE} 2>/dev/null || true
 echo SSH_VPN_READY
-trap 'nft delete table ip ssh_vpn_gui 2>/dev/null || true; iptables -t nat -D POSTROUTING -s {chosen.cidr} ! -o {chosen.remote_tun} -j MASQUERADE 2>/dev/null || true; ip addr flush dev {chosen.remote_tun} 2>/dev/null || true' EXIT
+trap '{_remote_nat_cleanup_snippet(chosen.remote_tun, chosen.cidr)}; {_remote_forward_cleanup_snippet(chosen)}; nft delete table ip ssh_vpn_gui 2>/dev/null || true; ip addr flush dev {chosen.remote_tun} 2>/dev/null || true' EXIT
 while true; do sleep 3600; done
 """.strip()
 
@@ -614,9 +771,15 @@ done
 
 def remote_cleanup_command(binding: TunnelBinding | None = None) -> str:
     chosen = binding or load_tunnel_state()
+    if chosen:
+        nat_cleanup = _remote_nat_cleanup_snippet(chosen.remote_tun, chosen.cidr)
+    else:
+        nat_cleanup = _remote_nat_cleanup_snippet("tun+", "10.255.")
     return f"""
 set -eu
 nft delete table ip ssh_vpn_gui 2>/dev/null || true
+{nat_cleanup}
+{_remote_forward_cleanup_snippet(chosen)}
 {_remote_tun_cleanup_snippet(chosen)}
 {_remote_ovpn_stop_snippet(cidr=chosen.cidr if chosen else None)}
 """.strip()
@@ -625,6 +788,7 @@ nft delete table ip ssh_vpn_gui 2>/dev/null || true
 def _remote_ovpn_stop_snippet(*, cidr: str | None = None) -> str:
     tracked = cidr or "10.255.0.0/16"
     return f"""
+while ip rule del priority {OVPN_KEEP_TUN_PRIORITY} 2>/dev/null; do :; done
 while ip rule del table {OVPN_TABLE} 2>/dev/null; do :; done
 ip route flush table {OVPN_TABLE} 2>/dev/null || true
 if command -v conntrack >/dev/null 2>&1; then
@@ -750,17 +914,19 @@ done
 }}
 echo SSH_VPN_REMOTE_OVPN $ovpn_dev
 
-sysctl -w net.ipv4.ip_forward=1 >/dev/null
-sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+{_remote_rp_filter_snippet()}
 
 # Timeouts belong to OpenVPN on this server. resolv-retry defaults to
 # infinite and is applied before --daemon returns, so a bad hostname
 # blocks this SSH script for minutes. One short resolve + one connect
 # attempt; the wait loop only watches that process.
-printf '\\n# ssh-vpn-gui timeouts\\nresolv-retry 3\\nconnect-retry-max 1\\nconnect-timeout {OVPN_CONNECT_TIMEOUT_SECONDS}\\nserver-poll-timeout {OVPN_CONNECT_TIMEOUT_SECONDS}\\n' >> {OVPN_CONFIG_PATH}
+printf '\\n# ssh-vpn-gui timeouts\\nresolv-retry 3\\nconnect-retry-max 1\\nconnect-timeout {OVPN_CONNECT_TIMEOUT_SECONDS}\\nserver-poll-timeout {OVPN_CONNECT_TIMEOUT_SECONDS}\\nignore-unknown-option disable-dco\\ndisable-dco\\n' >> {OVPN_CONFIG_PATH}
 echo 'SSH_VPN_OVPN_PROGRESS Starting OpenVPN cascade'
+# OpenVPN 2.7 DCO ignores --dev ovpnN and opens tun0, clobbering the SSH tun.
 openvpn \
   --config {OVPN_CONFIG_PATH} \
+  --ignore-unknown-option disable-dco \
+  --disable-dco \
   --dev-type tun \
   --dev "$ovpn_dev" \
   --route-noexec \
@@ -807,7 +973,15 @@ fi
 sysctl -w "net.ipv4.conf.$ovpn_dev.rp_filter=0" >/dev/null 2>&1 || true
 ip route replace default dev "$ovpn_dev" table {OVPN_TABLE}
 if [ -n "$cidr" ]; then
-  ip rule add from "$cidr" table {OVPN_TABLE} priority {OVPN_TABLE}
+  # Traffic from the SSH /30 to the internet goes via OpenVPN. Replies
+  # to the laptop peer must stay on the SSH tun — otherwise the local
+  # daemon's ping misses and it tears the session down.
+  ip rule add from "$cidr" to "$cidr" table main priority {OVPN_KEEP_TUN_PRIORITY} 2>/dev/null || true
+  ssh_tun=$(ip -4 -o addr show 2>/dev/null | awk '/inet 10\\.255\\.[0-9]+\\.2\\// {{print $2; exit}}')
+  if [ -n "$ssh_tun" ]; then
+    ip route replace "$cidr" dev "$ssh_tun" table {OVPN_TABLE} 2>/dev/null || true
+  fi
+  ip rule add from "$cidr" table {OVPN_TABLE} priority {OVPN_TABLE} 2>/dev/null || true
 fi
 echo SSH_VPN_OVPN_READY
 """.strip()

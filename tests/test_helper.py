@@ -79,6 +79,7 @@ def test_cascade_on_dry_run_uploads_selected_config(tmp_path, capsys) -> None:
     ][0].index("--daemon ssh-vpn-gui-ovpn")
     assert "seq 1 90" in payload["messages"][0]
     assert "--connect-timeout 8" in payload["messages"][0]
+    assert "--disable-dco" in payload["messages"][0]
     assert "--connect-retry-max 1" in payload["messages"][0]
     assert "openvpn failed to connect to the VPN server" in payload["messages"][0]
     assert "SSH_VPN_REMOTE_OVPN" in payload["messages"][0]
@@ -251,6 +252,7 @@ def test_disconnect_restores_local_routing_without_routing_cfg(monkeypatch, tmp_
     monkeypatch.setattr(helper, "require_root", lambda: None)
     monkeypatch.setattr(helper, "stop_dns_proxy", lambda **_kwargs: [])
     monkeypatch.setattr(helper, "stop_tunnel", lambda **_kwargs: [])
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: None)
 
     result = helper.main(
         [
@@ -271,6 +273,40 @@ def test_disconnect_restores_local_routing_without_routing_cfg(monkeypatch, tmp_
     assert "ip route del 0.0.0.0/1" in payload["messages"]
     assert "ip route del 128.0.0.0/1" in payload["messages"]
     assert "delete routes using claimed tuns" in payload["messages"]
+
+
+def test_disconnect_fail_closed_blackholes_proxy_without_opening_wan(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    routing_file = tmp_path / "missing.cfg"
+    dns_calls = []
+    monkeypatch.setattr(helper, "require_root", lambda: None)
+    monkeypatch.setattr(
+        helper, "stop_dns_proxy", lambda **_kwargs: dns_calls.append(True) or ["dns stopped"]
+    )
+    monkeypatch.setattr(helper, "stop_tunnel", lambda **_kwargs: ["tunnel stopped"])
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: None)
+
+    result = helper.main(
+        [
+            "disconnect",
+            "--fail-closed",
+            "--local-only",
+            "--server",
+            "203.0.113.10",
+            "--routing-file",
+            str(routing_file),
+            "--dry-run",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert payload["ok"] is True
+    assert dns_calls == []
+    assert "nft delete table inet ssh_vpn_gui" not in payload["messages"]
+    assert "ip route replace blackhole default table 2023" in payload["messages"]
+    assert any("non-direct traffic is blocked" in line for line in payload["messages"])
 
 
 def test_save_routing_rejects_invalid_rules_without_overwriting(

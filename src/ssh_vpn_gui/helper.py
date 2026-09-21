@@ -12,7 +12,7 @@ from .geoip import update_geoip
 from .geosite import update_geosite
 from .paths import SYSTEM_ROUTING_FILE
 from .routing_config import parse_routing_file, parse_routing_text
-from .routing_engine import RoutingEngine, reset_local_routing
+from .routing_engine import RoutingEngine, apply_fail_closed, reset_local_routing
 from .ssh_tunnel import (
     cleanup_remote,
     start_remote_ovpn,
@@ -25,6 +25,7 @@ from .system import (
     cleanup_legacy_singbox,
     cleanup_local_tun,
     load_tunnel_state,
+    is_fail_closed,
     preserve_server_route,
     require_root,
     setup_full_tunnel_routes,
@@ -68,10 +69,19 @@ def main(argv: list[str] | None = None) -> int:
             messages.extend(_connect(args, config, routing_file, runner, password))
         elif args.command == "disconnect":
             binding = None if args.dry_run else load_tunnel_state()
-            messages.extend(stop_dns_proxy(dry_run=args.dry_run))
             messages.extend(stop_tunnel(dry_run=args.dry_run))
-            reset_local_routing(runner)
-            cleanup_local_tun(runner, args.server)
+            if args.fail_closed:
+                cleanup_local_tun(runner, args.server)
+                apply_fail_closed(
+                    runner,
+                    full_tunnel=args.no_routing,
+                    server=args.server,
+                )
+                messages.append("non-direct traffic is blocked until routing is restored")
+            else:
+                messages.extend(stop_dns_proxy(dry_run=args.dry_run))
+                reset_local_routing(runner)
+                cleanup_local_tun(runner, args.server)
             messages.extend(runner.commands)
             if args.server and password and not args.local_only:
                 try:
@@ -189,6 +199,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--content-stdin", action="store_true", help="Read routing configuration content from stdin")
     parser.add_argument("--routing-file", default=str(SYSTEM_ROUTING_FILE))
     parser.add_argument("--no-routing", action="store_true", help="Connect SSH TUN without starting routing rules")
+    parser.add_argument(
+        "--fail-closed",
+        action="store_true",
+        help="On disconnect, block non-direct traffic instead of restoring the system default",
+    )
     parser.add_argument("--ovpn-file", help="Path to a .ovpn file to run as a cascaded VPN on the remote server")
     parser.add_argument("--skip-health-check", action="store_true", help="Skip rollback health check after connect")
     parser.add_argument(
@@ -262,8 +277,9 @@ def _connect(args: argparse.Namespace, config, routing_file: Path, runner: Comma
     messages: list[str] = []
     engine = RoutingEngine(config=config, server=args.server)
     ovpn_b64 = _read_ovpn_b64(args.ovpn_file)
+    stay_closed = is_fail_closed()
     try:
-        _cleanup_before_connect(args, config, runner)
+        _cleanup_before_connect(args, config, runner, stay_closed=stay_closed)
         messages.extend(
             start_tunnel(
                 args.server,
@@ -288,29 +304,41 @@ def _connect(args: argparse.Namespace, config, routing_file: Path, runner: Comma
             messages.extend(_health_check())
         return messages
     except Exception as exc:
-        rollback_messages = _rollback_after_failed_connect(args, config, password)
+        rollback_messages = _rollback_after_failed_connect(
+            args, config, password, fail_closed=stay_closed
+        )
         raise RuntimeError(f"connect failed, rolled back: {exc}; rollback: {' | '.join(rollback_messages)}") from exc
 
 
-def _cleanup_before_connect(args: argparse.Namespace, config, runner: CommandRunner) -> None:
-    stop_dns_proxy(dry_run=runner.dry_run)
+def _cleanup_before_connect(
+    args: argparse.Namespace, config, runner: CommandRunner, *, stay_closed: bool
+) -> None:
+    if not stay_closed:
+        stop_dns_proxy(dry_run=runner.dry_run)
     stop_tunnel(dry_run=runner.dry_run)
-    if args.server:
+    if args.server and not stay_closed:
         RoutingEngine(config=config, server=args.server).stop(runner)
     cleanup_local_tun(runner, args.server)
     cleanup_legacy_singbox(runner)
 
 
-def _rollback_after_failed_connect(args: argparse.Namespace, config, password: str) -> list[str]:
+def _rollback_after_failed_connect(
+    args: argparse.Namespace, config, password: str, *, fail_closed: bool
+) -> list[str]:
     runner = CommandRunner(dry_run=False)
     messages: list[str] = []
     binding = load_tunnel_state()
     try:
-        messages.extend(stop_dns_proxy(dry_run=False))
         messages.extend(stop_tunnel(dry_run=False))
-        if args.server:
-            RoutingEngine(config=config, server=args.server).stop(runner)
-        cleanup_local_tun(runner, args.server)
+        if fail_closed:
+            cleanup_local_tun(runner, args.server)
+            apply_fail_closed(runner, full_tunnel=args.no_routing, server=args.server)
+            messages.append("non-direct traffic is blocked until routing is restored")
+        else:
+            messages.extend(stop_dns_proxy(dry_run=False))
+            if args.server:
+                RoutingEngine(config=config, server=args.server).stop(runner)
+            cleanup_local_tun(runner, args.server)
         messages.extend(runner.commands)
     except Exception as exc:
         messages.append(f"rollback error: {exc}")

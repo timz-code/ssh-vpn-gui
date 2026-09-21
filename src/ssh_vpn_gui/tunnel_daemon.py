@@ -51,6 +51,7 @@ def main(argv: list[str] | None = None) -> int:
                 [
                     r"(?i)password:",
                     r"(?i)are you sure you want to continue connecting",
+                    r"SSH_VPN_NAT \S+ \S+",
                     "SSH_VPN_READY",
                     r"Permission denied",
                     pexpect.EOF,
@@ -62,12 +63,14 @@ def main(argv: list[str] | None = None) -> int:
             elif index == 1:
                 child.sendline("yes")
             elif index == 2:
+                print(str(child.after).strip(), flush=True)
+            elif index == 3:
                 print("SSH_VPN_READY", flush=True)
                 break
-            elif index == 3:
+            elif index == 4:
                 print("SSH authentication failed", file=sys.stderr, flush=True)
                 return 1
-            elif index == 4:
+            elif index == 5:
                 print(f"SSH exited before tunnel was ready: {child.before}", file=sys.stderr, flush=True)
                 return 1
             else:
@@ -76,13 +79,17 @@ def main(argv: list[str] | None = None) -> int:
 
         ready_at = time.monotonic()
         peer_failures = 0
+        peer_seen = False
         while child.isalive():
             if is_tun_peer_reachable(timeout=1.5):
                 peer_failures = 0
+                peer_seen = True
             else:
                 peer_failures += 1
                 elapsed = time.monotonic() - ready_at
-                if should_drop_unresponsive_peer(failures=peer_failures, elapsed_seconds=elapsed):
+                if peer_seen and should_drop_unresponsive_peer(
+                    failures=peer_failures, elapsed_seconds=elapsed
+                ):
                     print("Tunnel peer stopped responding", file=sys.stderr, flush=True)
                     child.close(force=True)
                     return 1

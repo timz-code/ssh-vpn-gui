@@ -69,6 +69,42 @@ def test_ovpn_bootstrap_picks_free_ovpn_device() -> None:
     assert '--dev "$ovpn_dev"' in script
     assert "--dev ovpn0" not in script
     assert "ip addr show ovpn0" not in script
+    assert 'from "$cidr" to "$cidr" table main priority 2123' in script
+    assert script.index('from "$cidr" to "$cidr" table main') < script.index(
+        'from "$cidr" table 2124'
+    )
+    assert "--disable-dco" in script
+    assert "-j SNAT --to-source" not in script
+
+
+def test_ovpn_stop_removes_keep_tun_rule() -> None:
+    script = system.remote_ovpn_cleanup_command()
+
+    assert "ip rule del priority 2123" in script
+    assert "ip rule del table 2124" in script
+
+
+def test_remote_setup_keeps_ssh_peer_off_the_ovpn_table() -> None:
+    script = system.remote_setup_script(
+        system.TunnelBinding(
+            local_tun="tun4",
+            remote_tun="tun7",
+            local_address="10.255.8.1",
+            remote_address="10.255.8.2",
+            cidr="10.255.8.0/30",
+        )
+    )
+
+    assert "from 10.255.8.0/30 to 10.255.8.0/30 table main priority 2123" in script
+    assert "ip route replace 10.255.8.0/30 dev tun7 table 2124" in script
+    assert "iptables -I FORWARD 1 -i tun7 -j ACCEPT" in script
+    assert "net.ipv4.conf.default.rp_filter=0" in script
+    assert "/proc/sys/net/ipv4/conf/*/rp_filter" in script
+    assert "net.ipv4.conf.all.forwarding=1" in script
+    assert "/proc/sys/net/ipv4/conf/*/forwarding" in script
+    assert "-j MASQUERADE" in script
+    assert "echo SSH_VPN_NAT masquerade" in script
+    assert "-j SNAT --to-source" not in script
 
 
 def test_save_tunnel_state_is_readable_without_root(monkeypatch, tmp_path) -> None:
@@ -83,6 +119,9 @@ def test_save_tunnel_state_is_readable_without_root(monkeypatch, tmp_path) -> No
             local_address="10.255.8.1",
             remote_address="10.255.8.2",
             cidr="10.255.8.0/30",
+            server="192.168.50.2",
+            underlay_via="192.168.1.1",
+            underlay_dev="wlp2s0",
         )
     )
 
@@ -91,6 +130,9 @@ def test_save_tunnel_state_is_readable_without_root(monkeypatch, tmp_path) -> No
     assert loaded is not None
     assert loaded.local_tun == "tun4"
     assert loaded.remote_tun == "tun7"
+    assert loaded.server == "192.168.50.2"
+    assert loaded.underlay_via == "192.168.1.1"
+    assert loaded.underlay_dev == "wlp2s0"
 
 
 def test_discover_local_binding_reads_claimed_p2p_address(monkeypatch) -> None:
@@ -107,10 +149,13 @@ def test_discover_local_binding_reads_claimed_p2p_address(monkeypatch) -> None:
     assert binding.cidr == "10.255.8.0/30"
 
 
-def test_remote_cleanup_without_state_does_not_touch_tun3() -> None:
+def test_remote_cleanup_without_state_does_not_touch_tun3(monkeypatch) -> None:
+    monkeypatch.setattr(system, "load_tunnel_state", lambda: None)
     script = system.remote_cleanup_command()
 
     assert "ip addr flush dev tun3" not in script
+    assert "iptables -D FORWARD -s 10.255.0.0/16 -j ACCEPT" in script
     assert "/sys/class/net/tun*" in script
     assert "/etc/ssh-vpn-gui/client.ovpn" in script
     assert 'ip link del "$ovpn_dev"' in script
+    assert '*"-s 10.255."*' in script

@@ -16,7 +16,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 from .paths import SUDOERS_RULE, SYSTEM_HELPER, SYSTEM_ROUTING_FILE
-from .system import OVPN_HELPER_TIMEOUT_SECONDS
+from .system import OVPN_HELPER_TIMEOUT_SECONDS, is_fail_closed
 from .tunnel_watch import TunnelSnapshot, evaluate_tunnel_health, inspect_tunnel
 
 
@@ -26,15 +26,27 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 WATCH_INTERVAL_MS = 4000
 WALL_SLEEP_GAP_SECONDS = 25
 DEAD_STREAK_LIMIT = 2
-MAX_AUTO_RECONNECTS = 1
+MAX_AUTO_RECONNECTS = 8
+SLOW_RECONNECT_INTERVAL_MS = 60_000
+
+
+def next_reconnect_delay_ms(attempts: int) -> int | None:
+    """Delay before the next auto-reconnect. None means try immediately."""
+    if attempts < MAX_AUTO_RECONNECTS:
+        return None
+    return SLOW_RECONNECT_INTERVAL_MS
 
 
 def wall_clock_implies_sleep(elapsed_seconds: float) -> bool:
     return elapsed_seconds > WALL_SLEEP_GAP_SECONDS
 
 
-def disconnect_args_for_reap(*, server: str, login: str, password: str) -> tuple[list[str], str | None]:
-    args = ["disconnect"]
+def disconnect_args_for_reap(
+    *, server: str, login: str, password: str, routing: bool = True
+) -> tuple[list[str], str | None]:
+    args = ["disconnect", "--fail-closed"]
+    if not routing:
+        args.append("--no-routing")
     if server and login and password:
         args.extend(["--server", server, "--login", login])
         return args, password
@@ -134,9 +146,12 @@ class RoutingEditorWindow(Gtk.Window):
 class SshVpnWindow(Adw.ApplicationWindow):
     def __init__(self, application: Adw.Application) -> None:
         super().__init__(application=application, title="SSH VPN")
-        self.set_default_size(520, 420)
+        self.set_default_size(680, 540)
         self.connected = False
         self.busy = False
+        self._fail_closed = False
+        self._exiting = False
+        self._exit_after_restore = False
         self._suppress_toggle = False
         self._pending_toggle: tuple[str, bool] | None = None
         self._watch_source: int | None = None
@@ -146,6 +161,8 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self._reaping = False
         self._pending_reconnect = False
         self._auto_reconnects = 0
+        self._auto_connect_in_flight = False
+        self._slow_reconnect_source: int | None = None
         self._resume_probe_active = False
         self._peer_watch_usable = False
         self._sleep_subscription = 0
@@ -195,6 +212,11 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self.disconnect_button.connect("clicked", self._on_disconnect_clicked)
         self.disconnect_button.set_sensitive(False)
 
+        self.exit_restore_button = Gtk.Button(label="Exit and Restore")
+        self.exit_restore_button.add_css_class("destructive-action")
+        self.exit_restore_button.connect("clicked", self._on_exit_restore_clicked)
+        self.exit_restore_button.set_visible(False)
+
         self.update_geo_button = Gtk.Button(label="Update Routing Data")
         self.update_geo_button.connect("clicked", self._on_update_geo_clicked)
 
@@ -210,8 +232,13 @@ class SshVpnWindow(Adw.ApplicationWindow):
 
         button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         button_box.set_margin_top(12)
+        button_box.set_hexpand(True)
         button_box.append(self.connect_button)
         button_box.append(self.disconnect_button)
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        button_box.append(spacer)
+        button_box.append(self.exit_restore_button)
 
         self.status = Gtk.Label(label="Ready")
         self.status.set_wrap(True)
@@ -226,7 +253,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
 
         self.status_scroller = Gtk.ScrolledWindow()
         self.status_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.status_scroller.set_size_request(-1, 120)
+        self.status_scroller.set_size_request(-1, 168)
         self.status_scroller.set_vexpand(True)
         self.status_scroller.add_css_class("card")
         self.status_scroller.set_child(self.status)
@@ -258,6 +285,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self.set_content(root)
         self._set_busy(False)
         self._subscribe_sleep_signal()
+        self.connect("close-request", self._on_close_request)
         GLib.idle_add(self._sync_existing_tunnel)
 
     def open_routing_editor(self) -> None:
@@ -274,6 +302,8 @@ class SshVpnWindow(Adw.ApplicationWindow):
     def _on_connect_clicked(self, _button: Gtk.Button | None) -> None:
         if _button is not None:
             self._auto_reconnects = 0
+            self._auto_connect_in_flight = False
+            self._cancel_slow_reconnect()
         server = self.server_entry.get_text().strip()
         login = self.login_entry.get_text().strip()
         password = self.password_entry.get_text()
@@ -298,6 +328,9 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self._run_helper(args, password=password, busy_text=busy_text)
 
     def _on_disconnect_clicked(self, _button: Gtk.Button) -> None:
+        self._pending_reconnect = False
+        self._auto_connect_in_flight = False
+        self._cancel_slow_reconnect()
         args = ["disconnect"]
         server = self.server_entry.get_text().strip()
         login = self.login_entry.get_text().strip()
@@ -306,6 +339,42 @@ class SshVpnWindow(Adw.ApplicationWindow):
             self._save_config()
             args.extend(["--server", server, "--login", login])
         self._run_helper(args, password=password, busy_text="Disconnecting...")
+
+    def _on_exit_restore_clicked(self, _button: Gtk.Button | None) -> None:
+        self._pending_reconnect = False
+        self._auto_connect_in_flight = False
+        self._cancel_slow_reconnect()
+        self._exiting = True
+        if self.busy:
+            self._exit_after_restore = True
+            self._set_status("Will restore system routing and exit when the current action finishes.")
+            return
+        self._start_exit_restore()
+
+    def _start_exit_restore(self) -> None:
+        args = ["disconnect"]
+        server = self.server_entry.get_text().strip()
+        login = self.login_entry.get_text().strip()
+        password = self.password_entry.get_text()
+        if server and login and password:
+            args.extend(["--server", server, "--login", login])
+        else:
+            args.append("--local-only")
+            if server:
+                args.extend(["--server", server])
+            password = None
+        self._run_helper(
+            args,
+            password=password,
+            busy_text="Restoring system routing, then exiting...",
+            action="exit-restore",
+        )
+
+    def _on_close_request(self, *_args) -> bool:
+        if self._fail_closed and not self._exiting:
+            self._on_exit_restore_clicked(None)
+            return True
+        return bool(self._exiting)
 
     def _on_update_geo_clicked(self, _button: Gtk.Button) -> None:
         self._run_helper(["update-geo"], password=None, busy_text="Updating routing data...")
@@ -450,13 +519,31 @@ class SshVpnWindow(Adw.ApplicationWindow):
         if result.get("ok"):
             if command == "connect":
                 self.connected = True
+                self._fail_closed = False
+                self._auto_reconnects = 0
+                self._auto_connect_in_flight = False
+                self._cancel_slow_reconnect()
                 self._dead_streak = 0
                 self._peer_watch_usable = False
                 self._start_watch()
             elif command == "disconnect":
                 self.connected = False
+                self._fail_closed = False
                 self._pending_reconnect = False
+                self._auto_connect_in_flight = False
+                self._cancel_slow_reconnect()
                 self._stop_watch()
+            elif command == "exit-restore":
+                self.connected = False
+                self._fail_closed = False
+                self._stop_watch()
+                self._set_busy(False)
+                application = self.get_application()
+                if application is not None:
+                    application.quit()
+                else:
+                    self.destroy()
+                return False
             if command in {"routing-on", "routing-off", "cascade-on", "cascade-off"}:
                 self._save_config()
             self._pending_toggle = None
@@ -466,6 +553,11 @@ class SshVpnWindow(Adw.ApplicationWindow):
             if command == "connect":
                 self.connected = False
                 self._stop_watch()
+                if is_fail_closed():
+                    self._fail_closed = True
+            elif command == "exit-restore":
+                self._exiting = False
+                self._exit_after_restore = False
             if self._pending_toggle is not None:
                 name, previous_state = self._pending_toggle
                 switch = self.routing_switch if name == "routing" else self.cascade_switch
@@ -474,14 +566,34 @@ class SshVpnWindow(Adw.ApplicationWindow):
                 self._save_config()
             self._set_status(result.get("error", "Unknown helper error"))
         self._set_busy(False)
+        if self._exit_after_restore and not self.busy:
+            self._exit_after_restore = False
+            self._start_exit_restore()
+            return False
+        if (
+            command == "connect"
+            and not result.get("ok")
+            and self._fail_closed
+            and not self._exiting
+        ):
+            if self._auto_connect_in_flight:
+                self._auto_reconnect()
+            else:
+                self._schedule_slow_reconnect()
         return False
 
     def _handle_reap_result(self, result: dict) -> bool:
         self._reaping = False
         self.connected = False
+        self._fail_closed = True
         self._stop_watch()
         reconnect = self._pending_reconnect
         self._pending_reconnect = False
+        if self._exit_after_restore:
+            self._set_busy(False)
+            self._exit_after_restore = False
+            self._start_exit_restore()
+            return False
         if result.get("ok") and reconnect:
             self._set_busy(False)
             self._auto_reconnect()
@@ -511,6 +623,13 @@ class SshVpnWindow(Adw.ApplicationWindow):
             self._peer_watch_usable = snapshot.peer_reachable
             self._start_watch()
             self._set_status("Existing SSH tunnel is still up.")
+            self._set_busy(False)
+        elif is_fail_closed():
+            self._fail_closed = True
+            self._set_status(
+                "Tunnel is down. Non-direct traffic is blocked. "
+                "Connect to retry, or Exit and Restore to return to the system routes."
+            )
             self._set_busy(False)
         elif snapshot.leftover:
             self._reap_dead_tunnel(
@@ -550,6 +669,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
         if going_to_sleep:
             return
         self._auto_reconnects = 0
+        self._cancel_slow_reconnect()
         GLib.idle_add(self._on_system_resumed)
 
     def _on_system_resumed(self) -> bool:
@@ -615,6 +735,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self._last_wall = now
         if wall_clock_implies_sleep(elapsed):
             self._auto_reconnects = 0
+            self._cancel_slow_reconnect()
             self._on_system_resumed()
             return True
         if not self.connected or self.busy or self._reaping or self._resume_probe_active or self._watch_in_flight:
@@ -662,6 +783,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
             server=self.server_entry.get_text().strip(),
             login=self.login_entry.get_text().strip(),
             password=self.password_entry.get_text(),
+            routing=self.routing_switch.get_active(),
         )
         remote = password is not None
         busy_text = (
@@ -671,11 +793,47 @@ class SshVpnWindow(Adw.ApplicationWindow):
         )
         self._run_helper(args, password=password, busy_text=busy_text, action="reap")
 
-    def _auto_reconnect(self) -> None:
-        if self._auto_reconnects >= MAX_AUTO_RECONNECTS:
-            self._set_status("Tunnel died. Automatic reconnect already failed. Click Connect to try again.")
+    def _cancel_slow_reconnect(self) -> None:
+        if self._slow_reconnect_source is not None:
+            GLib.source_remove(self._slow_reconnect_source)
+            self._slow_reconnect_source = None
+
+    def _schedule_slow_reconnect(self) -> None:
+        if self._exiting or self._exit_after_restore or self.connected:
             return
+        self._fail_closed = True
+        self._cancel_slow_reconnect()
+        self._slow_reconnect_source = GLib.timeout_add(
+            SLOW_RECONNECT_INTERVAL_MS, self._on_slow_reconnect_tick
+        )
+        self._set_status(
+            f"Tunnel died after {self._auto_reconnects} reconnect attempts. "
+            "Non-direct traffic is blocked. Next try in 1 minute."
+        )
+        self._set_busy(False)
+
+    def _on_slow_reconnect_tick(self) -> bool:
+        self._slow_reconnect_source = None
+        if self._exiting or self._exit_after_restore or self.connected or self.busy:
+            return False
+        self._auto_connect_in_flight = True
         self._auto_reconnects += 1
+        self._set_status(f"Tunnel still down. Reconnect {self._auto_reconnects}...")
+        self._on_connect_clicked(None)
+        return False
+
+    def _auto_reconnect(self) -> None:
+        if self._exiting or self._exit_after_restore:
+            return
+        delay = next_reconnect_delay_ms(self._auto_reconnects)
+        if delay is not None:
+            self._schedule_slow_reconnect()
+            return
+        self._auto_connect_in_flight = True
+        self._auto_reconnects += 1
+        self._set_status(
+            f"Tunnel died. Reconnect {self._auto_reconnects}/{MAX_AUTO_RECONNECTS}..."
+        )
         self._on_connect_clicked(None)
 
     def _set_busy(self, busy: bool) -> None:
@@ -703,6 +861,13 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self.server_entry.set_sensitive(credentials_editable)
         self.login_entry.set_sensitive(credentials_editable)
         self.password_entry.set_sensitive(credentials_editable)
+        self._update_exit_restore_button()
+
+    def _update_exit_restore_button(self) -> None:
+        self.exit_restore_button.set_visible(self._fail_closed)
+        self.exit_restore_button.set_sensitive(self._fail_closed)
+        if self._fail_closed and not self.connected:
+            self.set_title("SSH VPN — blocked")
 
     def _set_status(self, text: str) -> None:
         self.status.set_text(text)
