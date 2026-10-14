@@ -25,8 +25,8 @@ hop behind the tunnel.
 - **Cascaded VPN.** Run your own `.ovpn` profile on the VPS so that tunnel
   traffic leaves through your VPN provider.
 - **Kill switch.** If the tunnel dies, direct traffic keeps working and
-  everything else is blocked until the tunnel is back or you press
-  **Exit and Restore**.
+  everything else is blocked at once, even with the window closed, until the
+  tunnel is back or you press **Exit and Restore**.
 - **Automatic recovery.** A tunnel that died during sleep or lost its SSH
   session is cleaned up and reconnected: eight quick attempts, then once a
   minute.
@@ -54,6 +54,9 @@ your normal connection ──▶ Internet
 - Outgoing DNS queries are redirected to a local resolver that classifies
   every name with your rules and routes the resolved addresses accordingly.
 - Full-tunnel mode routes `0.0.0.0/1` and `128.0.0.0/1` into the tunnel.
+- Every route into the tunnel has a blackhole route behind it, so a dead
+  tunnel blocks traffic instead of leaking it. See
+  [When the tunnel drops](#when-the-tunnel-drops).
 - The SSH server's own address always stays on your normal connection, so the
   tunnel can never be routed into itself.
 
@@ -61,7 +64,8 @@ your normal connection ──▶ Internet
 
 ### Your computer
 
-- Ubuntu 22.04 or newer with a graphical desktop session.
+- Ubuntu 24.04 LTS or newer, including 26.04 LTS, with a graphical desktop
+  session.
 - Access to the server's SSH port. Only the standard port 22 is supported.
 
 The Debian package pulls in all local dependencies.
@@ -90,7 +94,9 @@ sudo apt install ./ssh-vpn-gui_*_all.deb
 Start **SSH VPN GUI** from the application menu or run `ssh-vpn-gui`.
 
 To upgrade, install the newer `.deb` the same way, then quit and reopen the
-app. Saved servers and `/etc/ssh-vpn-gui/routing.cfg` are kept. A
+app. If a tunnel was up during the upgrade, disconnect and connect again so it
+runs on the new version. Saved servers and `/etc/ssh-vpn-gui/routing.cfg` are
+kept. A
 `config.json` from a single-server version is converted to the server list on
 first launch.
 
@@ -113,8 +119,8 @@ deletes the selected server. The server list is locked while connected.
 
 Closing the window does not disconnect. The tunnel keeps running, and the
 window picks it up again the next time you open it. Use **Disconnect** to
-stop it, and read [When the tunnel drops](#when-the-tunnel-drops) before
-relying on the kill switch with the window closed.
+stop it. The kill switch keeps working while the window is closed; see
+[When the tunnel drops](#when-the-tunnel-drops).
 
 ## Routing rules
 
@@ -202,31 +208,37 @@ provider needs them.
 
 ## When the tunnel drops
 
+Every route into the tunnel has a blackhole route right behind it. When the
+SSH session ends, the kernel removes the tunnel device together with its
+routes, and the blackholes take over: traffic meant for the tunnel is dropped
+on the spot instead of falling back to your normal connection. This happens
+in the kernel, so it does not wait for the app and works with the window
+closed. In rule-based mode, direct destinations, your local network and the
+SSH server stay reachable. In full-tunnel mode, only your local network and
+the SSH server do.
+
 The app checks the tunnel every four seconds and right after the computer
 wakes up. When it finds the tunnel dead, it:
 
 1. Cleans up the dead session locally and, if the server is reachable, on the
    server too, including the OpenVPN client.
-2. Blocks all traffic that was going through the tunnel. Direct destinations,
-   your local network and the SSH server stay reachable. The title changes to
-   **SSH VPN — blocked**, and **Exit and Restore** appears to the right of
-   **Disconnect**.
+2. Changes the title to **SSH VPN — blocked** and shows **Exit and Restore**
+   to the right of **Disconnect**.
 3. Reconnects: eight attempts in a row, then once a minute until one
-   succeeds. A successful connect lifts the block.
+   succeeds. The block stays while it reconnects, and the new tunnel takes
+   over from it without a gap.
+
+If the tunnel died while the window was closed, the app opens in the blocked
+state. Click **Connect** to bring the tunnel back, or **Exit and Restore** to
+return to your normal connection.
 
 **Exit and Restore** removes the block and every routing change, cleans up the
 server if it is reachable, and closes the app. Closing the window while
 traffic is blocked does the same. **Connect** retries by hand. If it fails,
 the block stays.
 
-The kill switch runs inside the app window, which has two consequences:
-
-- The block arrives a few seconds after the drop, because the tunnel has to
-  miss two checks in a row first. Traffic sent in that gap can leave over your
-  normal connection.
-- If you close the window while connected, the tunnel keeps running but
-  nothing watches it. If it dies before you reopen the app, traffic is not
-  blocked.
+Routing changes live in memory only, so a reboot starts with your normal
+routes and no block.
 
 ## What changes on the server
 
@@ -289,8 +301,8 @@ sudo ssh-vpn-helper diagnose --server SERVER_IP
 - **Connection timed out:** check that port 22 on the server is reachable.
 - **Tunnel device open failed:** the VPS provider has TUN turned off.
 - **Routing data missing:** click **Update Routing Data**.
-- **Traffic is still blocked and the app is gone:** restore local routing
-  with `sudo ssh-vpn-helper disconnect --local-only`.
+- **Traffic is blocked and you want your normal connection back without the
+  app:** run `sudo ssh-vpn-helper disconnect --local-only`.
 
 Check the tunnel without changing anything:
 
@@ -339,7 +351,7 @@ Install the local system dependencies:
 ```bash
 sudo apt update
 sudo apt install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-venv \
-  openssh-client nftables policykit-1
+  openssh-client nftables polkitd pkexec
 ```
 
 Create an environment and run the tests:
@@ -361,12 +373,12 @@ PyGObject comes from Ubuntu's `python3-gi` package rather than from PyPI.
   `~/.config/ssh-vpn-gui/config.json` with mode `0600`.
 - A server's host key is accepted on the first connect and stored in
   `/var/lib/ssh-vpn-gui/known_hosts`. A changed key is rejected.
-- The tunnel carries IPv4 only. In rule-based mode, outgoing IPv6 is rejected
-  so it cannot bypass the tunnel. Full-tunnel mode leaves IPv6 and your DNS
-  settings untouched, so a resolver on your local network is still queried
-  directly.
-- The kill switch protects you only while the app window is running. See
-  [When the tunnel drops](#when-the-tunnel-drops).
+- The tunnel carries IPv4 only, so outgoing IPv6 is rejected in both modes
+  while the app manages routing; otherwise it would bypass the tunnel.
+- Full-tunnel mode leaves your DNS settings untouched, so a resolver on your
+  local network is still queried directly.
+- The kill switch does not need the app to be running, but it does not
+  survive a reboot. See [When the tunnel drops](#when-the-tunnel-drops).
 
 ## License
 

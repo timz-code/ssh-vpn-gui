@@ -6,15 +6,21 @@ import ipaddress
 from .routing_config import RoutingConfig
 from .system import (
     CommandRunner,
+    KILL_SWITCH_METRIC,
     OLD_FORCED_ROUTES,
     PROXY_MARK,
     PROXY_TABLE,
     STATE_DIR,
     cleanup_tun_routes,
     clear_fail_closed,
+    delete_proxy_rules,
+    ensure_proxy_rule,
+    ipv6_guard_down,
+    ipv6_guard_up,
     is_fail_closed,
     mark_fail_closed,
     preserve_server_route,
+    remove_full_tunnel_routes,
     routing_binding,
     underlay_ips,
 )
@@ -24,6 +30,7 @@ DNS_PORT = "53535"
 NFT_CONFIG = STATE_DIR / "nftables.conf"
 DOT_UPSTREAMS = ("1.1.1.1", "9.9.9.9")
 PROXY_ROUTES_FILE = STATE_DIR / "proxy-routes.txt"
+ROUTE_BATCH_FILE = STATE_DIR / "routes.batch"
 
 
 @dataclass(frozen=True)
@@ -32,13 +39,23 @@ class RoutingEngine:
     server: str
 
     def start(self, runner: CommandRunner) -> None:
-        self._reset_policy_routing(runner)
+        """Route by rules through the current tun.
+
+        New state goes in over the old one — nft swaps the table in one
+        transaction, routes are replaced in place, full-tunnel routes are
+        removed last — so a mode switch or a reconnect from the blocked
+        state has no moment where tunneled traffic can reach the WAN.
+        Per-IP proxy routes learned from DNS move to the new tun.
+        """
         runner.write_file(NFT_CONFIG, self._nft_config())
-        runner.write_file(PROXY_ROUTES_FILE, "")
         runner.run(["nft", "-f", str(NFT_CONFIG)])
         binding = routing_binding()
         runner.run(["ip", "route", "replace", "default", "dev", binding.local_tun, "src", binding.local_address, "table", PROXY_TABLE])
-        runner.run(["ip", "rule", "add", "fwmark", PROXY_MARK, "table", PROXY_TABLE, "priority", PROXY_TABLE], check=False)
+        runner.run(["ip", "route", "replace", "blackhole", "default", "table", PROXY_TABLE, "metric", KILL_SWITCH_METRIC])
+        ensure_proxy_rule(runner)
+        ipv6_guard_up(runner)
+        restore_dynamic_proxy_routes(runner)
+        remove_full_tunnel_routes(runner)
         if not runner.dry_run:
             clear_fail_closed()
         if self.server:
@@ -50,9 +67,6 @@ class RoutingEngine:
 
     def stop(self, runner: CommandRunner) -> None:
         reset_local_routing(runner)
-
-    def _reset_policy_routing(self, runner: CommandRunner) -> None:
-        _reset_policy_routing(runner)
 
     def add_static_ip_rules(self, runner: CommandRunner) -> None:
         protected = underlay_ips(self.server)
@@ -85,6 +99,8 @@ class RoutingEngine:
         mark_rules = "\n".join(f"    {rule}" for rule in self._mark_rules())
         binding = routing_binding()
         return f"""
+add table inet {NFT_TABLE}
+delete table inet {NFT_TABLE}
 table inet {NFT_TABLE} {{
   set direct4 {{
     type ipv4_addr;
@@ -111,13 +127,6 @@ table inet {NFT_TABLE} {{
   chain snat_tun {{
     type nat hook postrouting priority srcnat; policy accept;
     oifname "{binding.local_tun}" ip saddr != {binding.local_address} snat ip to {binding.local_address};
-  }}
-
-  chain reject6_output {{
-    type filter hook output priority filter; policy accept;
-    meta l4proto icmpv6 accept;
-    ip6 daddr ::1 accept;
-    meta nfproto ipv6 reject;
   }}
 }}
 """.strip() + "\n"
@@ -155,12 +164,15 @@ def add_resolved_ips(runner: CommandRunner, action: str, addresses: list[str], t
                 continue
             runner.run(["nft", "add", "element", "inet", NFT_TABLE, set_name, "{", str(ip), "timeout", timeout, "}"], check=False)
             if action == "proxy":
-                if is_fail_closed():
-                    continue
-                binding = routing_binding()
-                runner.run(["ip", "route", "replace", f"{ip}/32", "dev", binding.local_tun, "src", binding.local_address], check=False)
+                # The set entry expires with the DNS TTL; the /32 pair keeps
+                # an app that caches the address longer off the WAN.
+                if not is_fail_closed():
+                    binding = routing_binding()
+                    runner.run(["ip", "route", "replace", f"{ip}/32", "dev", binding.local_tun, "src", binding.local_address], check=False)
+                runner.run(["ip", "route", "replace", "blackhole", f"{ip}/32", "metric", KILL_SWITCH_METRIC], check=False)
                 _record_proxy_route(runner, str(ip))
             else:
+                runner.run(["ip", "route", "del", "blackhole", f"{ip}/32", "metric", KILL_SWITCH_METRIC], check=False)
                 runner.run(["ip", "route", "del", f"{ip}/32"], check=False)
 
 
@@ -172,16 +184,27 @@ def reset_local_routing(runner: CommandRunner) -> None:
     traffic to the system default path.
     """
     _reset_policy_routing(runner)
+    ipv6_guard_down(runner)
     cleanup_tun_routes(runner)
     if not runner.dry_run:
         clear_fail_closed()
 
 
+def stop_rule_mode(runner: CommandRunner) -> None:
+    """Remove rule-based routing. A caller that keeps the tunnel up must
+    install the full-tunnel routes before calling this."""
+    runner.run(["nft", "delete", "table", "inet", NFT_TABLE], check=False)
+    delete_proxy_rules(runner)
+    runner.run(["ip", "route", "flush", "table", PROXY_TABLE], check=False)
+    cleanup_dynamic_proxy_routes(runner)
+
+
 def apply_fail_closed(runner: CommandRunner, *, full_tunnel: bool = False, server: str | None = None) -> None:
     """Keep direct traffic on the WAN. Send everything else into a hole.
 
-    Used when the SSH tunnel is dead: proxy/full-tunnel destinations must
-    not fall back to the clearnet. Exit and Restore (or a clean
+    The blackholes are already installed next to every tun route, so when
+    ssh dies nothing leaks even before this runs; here they are re-asserted
+    and the state is flagged for the GUI. Exit and Restore (or a clean
     disconnect) calls reset_local_routing() to undo this.
     """
     if runner.dry_run:
@@ -190,40 +213,85 @@ def apply_fail_closed(runner: CommandRunner, *, full_tunnel: bool = False, serve
         mark_fail_closed()
     if full_tunnel:
         for route in OLD_FORCED_ROUTES:
-            runner.run(["ip", "route", "replace", "blackhole", route], check=False)
+            runner.run(["ip", "route", "replace", "blackhole", route, "metric", KILL_SWITCH_METRIC], check=False)
     else:
         runner.run(
-            ["ip", "route", "replace", "blackhole", "default", "table", PROXY_TABLE],
+            ["ip", "route", "replace", "blackhole", "default", "table", PROXY_TABLE, "metric", KILL_SWITCH_METRIC],
             check=False,
         )
-        runner.run(
-            ["ip", "rule", "add", "fwmark", PROXY_MARK, "table", PROXY_TABLE, "priority", PROXY_TABLE],
-            check=False,
-        )
+        ensure_proxy_rule(runner)
+    ipv6_guard_up(runner, check=False)
     if server:
-        preserve_server_route(runner, server)
+        preserve_server_route(runner, server, refresh=True)
+
+
+def let_server_through(runner: CommandRunner, server: str) -> None:
+    """Let ssh reach the server, possibly a different one, while blocked."""
+    runner.run(["nft", "add", "element", "inet", NFT_TABLE, "direct4", "{", server, "}"], check=False)
+    preserve_server_route(runner, server, refresh=True)
 
 
 def _reset_policy_routing(runner: CommandRunner) -> None:
-    runner.run(["nft", "delete", "table", "inet", NFT_TABLE], check=False)
-    runner.run(["ip", "rule", "del", "fwmark", PROXY_MARK, "table", PROXY_TABLE], check=False)
-    runner.run(["ip", "route", "flush", "table", PROXY_TABLE], check=False)
-    cleanup_dynamic_proxy_routes(runner)
-    for route in OLD_FORCED_ROUTES:
-        runner.run(["ip", "route", "del", route], check=False)
+    stop_rule_mode(runner)
+    remove_full_tunnel_routes(runner)
 
 
 def cleanup_dynamic_proxy_routes(runner: CommandRunner) -> None:
     if runner.dry_run:
         runner.commands.append(f"cleanup routes from {PROXY_ROUTES_FILE}")
         return
-    if not PROXY_ROUTES_FILE.exists():
-        return
-    protected = underlay_ips()
-    for address in PROXY_ROUTES_FILE.read_text(encoding="utf-8").splitlines():
-        if address and address not in protected:
-            runner.run(["ip", "route", "del", f"{address}/32"], check=False)
+    _route_batch(
+        runner,
+        [
+            line
+            for address in _recorded_proxy_routes()
+            for line in (
+                f"route del blackhole {address}/32 metric {KILL_SWITCH_METRIC}",
+                f"route del {address}/32",
+            )
+        ],
+    )
     PROXY_ROUTES_FILE.unlink(missing_ok=True)
+
+
+def restore_dynamic_proxy_routes(runner: CommandRunner) -> None:
+    if runner.dry_run:
+        runner.commands.append(f"restore routes from {PROXY_ROUTES_FILE}")
+        return
+    binding = routing_binding()
+    _route_batch(
+        runner,
+        [
+            line
+            for address in _recorded_proxy_routes()
+            for line in (
+                f"route replace {address}/32 dev {binding.local_tun} src {binding.local_address}",
+                f"route replace blackhole {address}/32 metric {KILL_SWITCH_METRIC}",
+            )
+        ],
+    )
+
+
+def _recorded_proxy_routes() -> list[str]:
+    if not PROXY_ROUTES_FILE.exists():
+        return []
+    protected = underlay_ips()
+    addresses: list[str] = []
+    for line in PROXY_ROUTES_FILE.read_text(encoding="utf-8").splitlines():
+        try:
+            address = str(ipaddress.IPv4Address(line.strip()))
+        except ValueError:
+            continue
+        if address not in protected:
+            addresses.append(address)
+    return addresses
+
+
+def _route_batch(runner: CommandRunner, lines: list[str]) -> None:
+    if not lines:
+        return
+    runner.write_file(ROUTE_BATCH_FILE, "\n".join(lines) + "\n")
+    runner.run(["ip", "-force", "-batch", str(ROUTE_BATCH_FILE)], check=False)
 
 
 def _record_proxy_route(runner: CommandRunner, address: str) -> None:

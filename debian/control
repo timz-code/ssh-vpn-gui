@@ -22,14 +22,15 @@ Depends:
  gir1.2-adw-1,
  gir1.2-gtk-4.0,
  iproute2,
+ iputils-ping,
  nftables,
  openssh-client,
- policykit-1,
+ pkexec,
+ polkitd,
  procps,
  python3-gi,
  python3-maxminddb,
  python3-pexpect,
- sudo,
 Description: GTK GUI for SSH TUN VPN routing
  SSH VPN GUI manages an OpenSSH TUN tunnel and local nftables routing rules
  from a GTK/Libadwaita desktop application. It includes a privileged helper

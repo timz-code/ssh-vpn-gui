@@ -36,6 +36,12 @@ def test_snapshot_leftover_and_reason() -> None:
     assert any("reachable" in line for line in healthy.messages())
 
 
+def test_session_that_died_without_disconnect_is_leftover() -> None:
+    assert TunnelSnapshot(False, False, False, session_saved=True).leftover is True
+    assert TunnelSnapshot(False, False, False).leftover is False
+    assert TunnelSnapshot(True, True, True, session_saved=True).leftover is False
+
+
 def test_evaluate_tunnel_health_ignores_peer_until_ping_has_worked() -> None:
     process_only = TunnelSnapshot(True, True, False)
     healthy, usable = evaluate_tunnel_health(
@@ -81,11 +87,32 @@ def test_inspect_tunnel_skips_ping_when_tun_is_down(monkeypatch) -> None:
         "ssh_vpn_gui.tunnel_watch.is_tun_peer_reachable",
         lambda **_kwargs: ping_calls.append(True) or True,
     )
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: None)
 
     snapshot = inspect_tunnel()
 
     assert snapshot == TunnelSnapshot(True, False, False)
     assert ping_calls == []
+
+
+def test_inspect_tunnel_notices_a_saved_session_after_the_daemon_died(monkeypatch) -> None:
+    monkeypatch.setattr(ssh_tunnel, "is_tunnel_daemon_alive", lambda: False)
+    monkeypatch.setattr("ssh_vpn_gui.tunnel_watch.is_tun_present", lambda: False)
+    monkeypatch.setattr(
+        "ssh_vpn_gui.system.load_tunnel_state",
+        lambda: TunnelBinding(
+            local_tun="tun4",
+            remote_tun="tun7",
+            local_address="10.255.8.1",
+            remote_address="10.255.8.2",
+            cidr="10.255.8.0/30",
+        ),
+    )
+
+    snapshot = inspect_tunnel()
+
+    assert snapshot.session_saved is True
+    assert snapshot.leftover is True
 
 
 def test_inspect_tunnel_requires_reachable_peer(monkeypatch) -> None:

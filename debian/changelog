@@ -1,3 +1,27 @@
+ssh-vpn-gui (0.2.36) unstable; urgency=medium
+
+  * Depend on polkitd and pkexec instead of the policykit-1 transitional
+    package, which Ubuntu 26.04 no longer ships. Drop the hard sudo
+    dependency (pkexec is the default path) and add iputils-ping, which
+    the tunnel watchdog needs.
+  * Kill switch without a gap: every route into the tunnel now has a
+    blackhole route behind it, so when ssh dies the kernel drops
+    tunneled traffic at once instead of sending it out the WAN until
+    the app notices. Works with the window closed.
+  * Per-IP proxy routes learned from DNS get the same blackhole, so an
+    app that caches an address past its DNS TTL stays blocked too.
+  * Reconnecting from the blocked state keeps the block until the new
+    tunnel is routed, keeps the SSH server reachable (also a newly
+    selected one, and after a network change), and no longer fails in
+    full-tunnel mode. Mode switches and rule reloads add the new routes
+    before removing the old ones; the nftables table is swapped in one
+    transaction.
+  * Reject outgoing IPv6 in full-tunnel mode as well.
+  * Open in the blocked state when the tunnel died while the window was
+    closed.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Wed, 14 Oct 2026 16:36:00 +0300
+
 ssh-vpn-gui (0.2.35) unstable; urgency=medium
 
   * Put the server menu and the + / − buttons back on one row. The menu

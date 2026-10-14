@@ -16,6 +16,9 @@ class TunnelSnapshot:
     daemon_alive: bool
     tun_present: bool
     peer_reachable: bool
+    # tunnel.env outlives a session that died without a disconnect, and so
+    # do the kill-switch routes it armed.
+    session_saved: bool = False
 
     @property
     def process_up(self) -> bool:
@@ -27,7 +30,7 @@ class TunnelSnapshot:
 
     @property
     def leftover(self) -> bool:
-        return (self.daemon_alive or self.tun_present) and not self.process_up
+        return (self.daemon_alive or self.tun_present or self.session_saved) and not self.process_up
 
     @property
     def reason(self) -> str:
@@ -67,6 +70,7 @@ def inspect_tunnel(*, ping_timeout: float = 1.5) -> TunnelSnapshot:
         daemon_alive=daemon_alive,
         tun_present=tun_present,
         peer_reachable=peer_reachable,
+        session_saved=system.load_tunnel_state() is not None,
     )
 
 

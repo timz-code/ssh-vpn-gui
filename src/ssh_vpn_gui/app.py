@@ -28,6 +28,10 @@ WALL_SLEEP_GAP_SECONDS = 25
 DEAD_STREAK_LIMIT = 2
 MAX_AUTO_RECONNECTS = 8
 SLOW_RECONNECT_INTERVAL_MS = 60_000
+BLOCKED_STATUS = (
+    "Tunnel is down. Non-direct traffic is blocked. "
+    "Connect to retry, or Exit and Restore to return to the system routes."
+)
 
 
 def next_reconnect_delay_ms(attempts: int) -> int | None:
@@ -725,9 +729,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
             self._auto_reconnect()
             return False
         if result.get("ok"):
-            messages = result.get("messages") or []
-            detail = "\n".join(messages[-3:]) if messages else "Leftover tunnel state was removed."
-            self._set_status(detail)
+            self._set_status(BLOCKED_STATUS)
         else:
             self._set_status(result.get("error", "Unable to clean up the dead tunnel"))
         self._set_busy(False)
@@ -750,19 +752,16 @@ class SshVpnWindow(Adw.ApplicationWindow):
             self._start_watch()
             self._set_status("Existing SSH tunnel is still up.")
             self._set_busy(False)
-        elif is_fail_closed():
-            self._fail_closed = True
-            self._set_status(
-                "Tunnel is down. Non-direct traffic is blocked. "
-                "Connect to retry, or Exit and Restore to return to the system routes."
-            )
-            self._set_busy(False)
         elif snapshot.leftover:
             self._reap_dead_tunnel(
                 snapshot,
                 reconnect=False,
                 reason="A previous tunnel is no longer healthy.",
             )
+        elif is_fail_closed():
+            self._fail_closed = True
+            self._set_status(BLOCKED_STATUS)
+            self._set_busy(False)
         return False
 
     def _subscribe_sleep_signal(self) -> None:

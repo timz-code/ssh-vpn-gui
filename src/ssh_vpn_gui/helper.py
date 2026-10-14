@@ -12,7 +12,13 @@ from .geoip import update_geoip
 from .geosite import update_geosite
 from .paths import SYSTEM_ROUTING_FILE
 from .routing_config import parse_routing_file, parse_routing_text
-from .routing_engine import RoutingEngine, apply_fail_closed, reset_local_routing
+from .routing_engine import (
+    RoutingEngine,
+    apply_fail_closed,
+    let_server_through,
+    reset_local_routing,
+    stop_rule_mode,
+)
 from .ssh_tunnel import (
     cleanup_remote,
     start_remote_ovpn,
@@ -24,6 +30,7 @@ from .system import (
     CommandRunner,
     cleanup_legacy_singbox,
     cleanup_local_tun,
+    clear_fail_closed,
     load_tunnel_state,
     is_fail_closed,
     preserve_server_route,
@@ -71,7 +78,9 @@ def main(argv: list[str] | None = None) -> int:
             binding = None if args.dry_run else load_tunnel_state()
             messages.extend(stop_tunnel(dry_run=args.dry_run))
             if args.fail_closed:
-                cleanup_local_tun(runner, args.server)
+                # The server pin stays: reconnects and the remote cleanup
+                # below must still reach it past the blackholes.
+                cleanup_local_tun(runner)
                 apply_fail_closed(
                     runner,
                     full_tunnel=args.no_routing,
@@ -109,11 +118,11 @@ def main(argv: list[str] | None = None) -> int:
             messages.extend(start_dns_proxy(routing_file, dry_run=args.dry_run))
             messages.extend(runner.commands)
         elif args.command == "routing-off":
+            _require_server(args.server)
+            preserve_server_route(runner, args.server)
+            setup_full_tunnel_routes(runner)
             messages.extend(stop_dns_proxy(dry_run=args.dry_run))
-            if args.server:
-                RoutingEngine(config=config, server=args.server).stop(runner)
-                preserve_server_route(runner, args.server)
-                setup_full_tunnel_routes(runner, cleanup_first=False)
+            stop_rule_mode(runner)
             messages.extend(runner.commands)
         elif args.command == "cascade-on":
             _require_server(args.server)
@@ -297,8 +306,11 @@ def _connect(args: argparse.Namespace, config, routing_file: Path, runner: Comma
             engine.add_static_ip_rules(runner)
             messages.extend(start_dns_proxy(routing_file, dry_run=args.dry_run))
         else:
-            engine.stop(runner)
             setup_full_tunnel_routes(runner)
+            stop_dns_proxy(dry_run=args.dry_run)
+            stop_rule_mode(runner)
+            if not args.dry_run:
+                clear_fail_closed()
         messages.extend(runner.commands)
         if not args.dry_run and not args.skip_health_check:
             messages.extend(_health_check())
@@ -316,9 +328,14 @@ def _cleanup_before_connect(
     if not stay_closed:
         stop_dns_proxy(dry_run=runner.dry_run)
     stop_tunnel(dry_run=runner.dry_run)
-    if args.server and not stay_closed:
-        RoutingEngine(config=config, server=args.server).stop(runner)
-    cleanup_local_tun(runner, args.server)
+    if stay_closed:
+        cleanup_local_tun(runner)
+        if args.server:
+            let_server_through(runner, args.server)
+    else:
+        if args.server:
+            RoutingEngine(config=config, server=args.server).stop(runner)
+        cleanup_local_tun(runner, args.server)
     cleanup_legacy_singbox(runner)
 
 
@@ -331,7 +348,7 @@ def _rollback_after_failed_connect(
     try:
         messages.extend(stop_tunnel(dry_run=False))
         if fail_closed:
-            cleanup_local_tun(runner, args.server)
+            cleanup_local_tun(runner)
             apply_fail_closed(runner, full_tunnel=args.no_routing, server=args.server)
             messages.append("non-direct traffic is blocked until routing is restored")
         else:

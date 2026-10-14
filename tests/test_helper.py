@@ -286,6 +286,7 @@ def test_disconnect_fail_closed_blackholes_proxy_without_opening_wan(
     )
     monkeypatch.setattr(helper, "stop_tunnel", lambda **_kwargs: ["tunnel stopped"])
     monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: None)
+    monkeypatch.setattr("ssh_vpn_gui.system._tuns_holding_app_p2p", lambda: [])
 
     result = helper.main(
         [
@@ -305,8 +306,111 @@ def test_disconnect_fail_closed_blackholes_proxy_without_opening_wan(
     assert payload["ok"] is True
     assert dns_calls == []
     assert "nft delete table inet ssh_vpn_gui" not in payload["messages"]
-    assert "ip route replace blackhole default table 2023" in payload["messages"]
+    assert "ip route replace blackhole default table 2023 metric 4095" in payload["messages"]
+    assert "ip route del 203.0.113.10/32" not in payload["messages"]
+    assert "ip route replace 203.0.113.10/32 via <gw> dev <underlay>" in payload["messages"]
     assert any("non-direct traffic is blocked" in line for line in payload["messages"])
+
+
+def _connect_while_blocked(monkeypatch, tmp_path, extra_args):
+    from dataclasses import dataclass
+
+    routing_file = tmp_path / "routing.cfg"
+    routing_file.write_text("default: proxy\n", encoding="utf-8")
+    runners = []
+    at_ssh_start = []
+
+    @dataclass
+    class CapturingRunner(helper.CommandRunner):
+        def __post_init__(self):
+            runners.append(self)
+
+    def fake_start_tunnel(*_args, **_kwargs):
+        at_ssh_start.extend(runners[0].commands)
+        return ["ssh started"]
+
+    monkeypatch.setattr(helper, "CommandRunner", CapturingRunner)
+    monkeypatch.setattr(helper, "is_fail_closed", lambda: True)
+    monkeypatch.setattr(helper, "start_tunnel", fake_start_tunnel)
+    monkeypatch.setattr(helper, "stop_tunnel", lambda **_kwargs: [])
+    monkeypatch.setattr(helper, "stop_dns_proxy", lambda **_kwargs: [])
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: None)
+    monkeypatch.setattr("ssh_vpn_gui.system._tuns_holding_app_p2p", lambda: [])
+
+    result = helper.main(
+        [
+            "connect",
+            "--server",
+            "198.51.100.7",
+            "--password",
+            "secret",
+            "--routing-file",
+            str(routing_file),
+            "--dry-run",
+            *extra_args,
+        ]
+    )
+    return result, runners[0].commands, at_ssh_start
+
+
+def test_reconnect_while_blocked_lets_the_server_through_before_ssh(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    result, commands, at_ssh_start = _connect_while_blocked(monkeypatch, tmp_path, [])
+
+    assert result == 0, capsys.readouterr().out
+    assert "nft add element inet ssh_vpn_gui direct4 { 198.51.100.7 }" in at_ssh_start
+    assert "ip route replace 198.51.100.7/32 via <gw> dev <underlay>" in at_ssh_start
+    assert "ip route del 198.51.100.7/32" not in commands
+    assert "nft delete table inet ssh_vpn_gui" not in commands
+    assert "ip route flush table 2023" not in commands
+    assert "ip route replace blackhole default table 2023 metric 4095" in commands
+
+
+def test_full_tunnel_reconnect_while_blocked_routes_before_dropping_rule_mode(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    result, commands, _ = _connect_while_blocked(monkeypatch, tmp_path, ["--no-routing"])
+
+    assert result == 0, capsys.readouterr().out
+    assert "ip route del 198.51.100.7/32" not in commands
+    full_tunnel_ready = max(
+        commands.index("ip route replace 0.0.0.0/1 dev tun3 src 10.255.3.1"),
+        commands.index("ip route replace blackhole 0.0.0.0/1 metric 4095"),
+        commands.index("ip route replace 128.0.0.0/1 dev tun3 src 10.255.3.1"),
+        commands.index("ip route replace blackhole 128.0.0.0/1 metric 4095"),
+    )
+    assert commands.index("nft delete table inet ssh_vpn_gui") > full_tunnel_ready
+    assert commands.index("ip route flush table 2023") > full_tunnel_ready
+
+
+def test_routing_off_installs_full_tunnel_before_dropping_rule_mode(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    routing_file = tmp_path / "routing.cfg"
+    routing_file.write_text("default: proxy\n", encoding="utf-8")
+    monkeypatch.setattr(helper, "stop_dns_proxy", lambda **_kwargs: [])
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: None)
+
+    result = helper.main(
+        [
+            "routing-off",
+            "--server",
+            "203.0.113.10",
+            "--routing-file",
+            str(routing_file),
+            "--dry-run",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    messages = payload["messages"]
+    assert result == 0
+    assert messages.index("ip route replace blackhole 128.0.0.0/1 metric 4095") < messages.index(
+        "nft delete table inet ssh_vpn_gui"
+    )
+    assert "ip route del 0.0.0.0/1" not in messages
+    assert not any(line.startswith("delete routes using") for line in messages)
 
 
 def test_save_routing_rejects_invalid_rules_without_overwriting(

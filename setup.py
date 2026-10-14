@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="ssh-vpn-gui",
-    version="0.2.35",
+    version="0.2.36",
     description="Ubuntu GTK GUI for SSH -w TUN VPN routing with local DNS and nftables",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",

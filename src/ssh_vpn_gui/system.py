@@ -17,6 +17,12 @@ TUN_CIDR = "10.255.3.0/30"
 PROXY_MARK = "2023"
 PROXY_TABLE = "2023"
 OLD_FORCED_ROUTES = ("0.0.0.0/1", "128.0.0.0/1")
+# Every tun route gets a blackhole twin at this metric. When ssh exits the
+# kernel deletes the tun with its routes, and the twin is what remains, so
+# tunneled destinations never fall through to the WAN default route.
+KILL_SWITCH_METRIC = "4095"
+IPV6_GUARD_TABLE = "ssh_vpn_gui_v6"
+IPV6_GUARD_CONFIG = STATE_DIR / "ipv6-guard.nft"
 SINGBOX_PID = STATE_DIR / "sing-box.pid"
 
 OVPN_DEV = "ovpn0"
@@ -371,42 +377,75 @@ def setup_local_tun(runner: CommandRunner) -> None:
     runner.run(["ip", "link", "set", binding.local_tun, "up"])
 
 
-def setup_proxy_routes(runner: CommandRunner) -> None:
-    cleanup_proxy_routes(runner)
+def ensure_proxy_rule(runner: CommandRunner) -> None:
+    add = ["ip", "rule", "add", "fwmark", PROXY_MARK, "table", PROXY_TABLE, "priority", PROXY_TABLE]
+    if runner.dry_run:
+        runner.run(add, check=False)
+        return
+    count = _proxy_rule_count(runner)
+    if count == 0:
+        runner.run(add, check=False)
+    for _ in range(count - 1):
+        runner.run(["ip", "rule", "del", "fwmark", PROXY_MARK, "table", PROXY_TABLE], check=False)
+
+
+def delete_proxy_rules(runner: CommandRunner) -> None:
+    delete = ["ip", "rule", "del", "fwmark", PROXY_MARK, "table", PROXY_TABLE]
+    if runner.dry_run:
+        runner.run(delete, check=False)
+        return
+    for _ in range(max(1, _proxy_rule_count(runner))):
+        runner.run(delete, check=False)
+
+
+def _proxy_rule_count(runner: CommandRunner) -> int:
+    listing = runner.run(["ip", "-4", "rule", "show"], check=False)
+    if listing is None or listing.returncode != 0:
+        return 0
+    mark = f"fwmark {int(PROXY_MARK):#x}"
+    lookup = f"lookup {PROXY_TABLE}"
+    return sum(1 for line in listing.stdout.splitlines() if mark in line and lookup in line)
+
+
+def setup_full_tunnel_routes(runner: CommandRunner) -> None:
     binding = routing_binding()
-    runner.run(
-        [
-            "ip",
-            "route",
-            "replace",
-            "default",
-            "dev",
-            binding.local_tun,
-            "src",
-            binding.local_address,
-            "table",
-            PROXY_TABLE,
-        ]
-    )
-    runner.run(["ip", "rule", "add", "fwmark", PROXY_MARK, "table", PROXY_TABLE, "priority", PROXY_TABLE])
-
-
-def cleanup_proxy_routes(runner: CommandRunner) -> None:
-    runner.run(["ip", "rule", "del", "fwmark", PROXY_MARK, "table", PROXY_TABLE], check=False)
-    runner.run(["ip", "route", "flush", "table", PROXY_TABLE], check=False)
+    ipv6_guard_up(runner)
     for route in OLD_FORCED_ROUTES:
-        runner.run(["ip", "route", "del", route], check=False)
-    cleanup_tun_routes(runner)
-
-
-def setup_full_tunnel_routes(runner: CommandRunner, *, cleanup_first: bool = True) -> None:
-    if cleanup_first:
-        cleanup_proxy_routes(runner)
-    for route in OLD_FORCED_ROUTES:
-        binding = routing_binding()
         runner.run(
             ["ip", "route", "replace", route, "dev", binding.local_tun, "src", binding.local_address]
         )
+        runner.run(["ip", "route", "replace", "blackhole", route, "metric", KILL_SWITCH_METRIC])
+
+
+def remove_full_tunnel_routes(runner: CommandRunner) -> None:
+    for route in OLD_FORCED_ROUTES:
+        runner.run(["ip", "route", "del", "blackhole", route, "metric", KILL_SWITCH_METRIC], check=False)
+        runner.run(["ip", "route", "del", route], check=False)
+
+
+def ipv6_guard_up(runner: CommandRunner, *, check: bool = True) -> None:
+    runner.write_file(IPV6_GUARD_CONFIG, _ipv6_guard_config())
+    runner.run(["nft", "-f", str(IPV6_GUARD_CONFIG)], check=check)
+
+
+def ipv6_guard_down(runner: CommandRunner) -> None:
+    runner.run(["nft", "delete", "table", "inet", IPV6_GUARD_TABLE], check=False)
+
+
+def _ipv6_guard_config() -> str:
+    # The tunnel is IPv4-only: any IPv6 that leaves goes around it.
+    return f"""
+add table inet {IPV6_GUARD_TABLE}
+delete table inet {IPV6_GUARD_TABLE}
+table inet {IPV6_GUARD_TABLE} {{
+  chain reject6_output {{
+    type filter hook output priority filter; policy accept;
+    meta l4proto icmpv6 accept;
+    ip6 daddr ::1 accept;
+    meta nfproto ipv6 reject;
+  }}
+}}
+""".strip() + "\n"
 
 
 def underlay_ips(*extra: str) -> set[str]:
@@ -427,14 +466,18 @@ def _route_via_dev(stdout: str) -> tuple[str, str]:
     return via, dev
 
 
-def _lookup_underlay(runner: CommandRunner, server: str, avoid_dev: str) -> tuple[str, str]:
-    route = runner.run(["ip", "route", "get", server])
-    if route is not None:
-        via, dev = _route_via_dev(route.stdout)
-        if dev and dev != avoid_dev:
-            return via, dev
-    default = runner.run(["ip", "-4", "route", "show", "default"])
-    if default is None:
+def _lookup_underlay(
+    runner: CommandRunner, server: str, avoid_dev: str, *, route_get: bool = True
+) -> tuple[str, str]:
+    if route_get:
+        # Fails with EINVAL when only a kill-switch blackhole matches.
+        route = runner.run(["ip", "route", "get", server], check=False)
+        if route is not None and route.returncode == 0:
+            via, dev = _route_via_dev(route.stdout)
+            if dev and dev != avoid_dev:
+                return via, dev
+    default = runner.run(["ip", "-4", "route", "show", "default"], check=False)
+    if default is None or default.returncode != 0:
         return "", ""
     via, dev = _route_via_dev(default.stdout)
     if dev == avoid_dev:
@@ -442,24 +485,31 @@ def _lookup_underlay(runner: CommandRunner, server: str, avoid_dev: str) -> tupl
     return via, dev
 
 
-def preserve_server_route(runner: CommandRunner, server: str) -> None:
+def preserve_server_route(runner: CommandRunner, server: str, *, refresh: bool = False) -> None:
+    """Pin the SSH server to the WAN.
+
+    refresh=True re-reads the main default route instead of trusting the
+    saved pin, so a reconnect after a network change does not dial out
+    through a dead gateway. It never raises: it runs while traffic is
+    blocked and must not abort the block.
+    """
     if not server:
         return
     state = load_tunnel_state()
     avoid_dev = state.local_tun if state else ""
-    via = state.underlay_via if state else ""
-    dev = state.underlay_dev if state else ""
+    via = state.underlay_via if state and not refresh else ""
+    dev = state.underlay_dev if state and not refresh else ""
     if dev == avoid_dev:
         via, dev = "", ""
     if runner.dry_run:
-        runner.commands.append(f"ip route get {server}")
+        runner.commands.append("ip -4 route show default" if refresh else f"ip route get {server}")
         runner.commands.append(
             f"ip route replace {server}/32 via {via or '<gw>'} dev {dev or '<underlay>'}"
         )
         return
 
     if not via and not dev:
-        via, dev = _lookup_underlay(runner, server, avoid_dev)
+        via, dev = _lookup_underlay(runner, server, avoid_dev, route_get=not refresh)
         if state and (via or dev):
             save_tunnel_state(replace(state, server=server, underlay_via=via, underlay_dev=dev))
     command = ["ip", "route", "replace", f"{server}/32"]
@@ -469,7 +519,7 @@ def preserve_server_route(runner: CommandRunner, server: str) -> None:
         command.extend(["dev", dev])
     if len(command) == 4:
         return
-    runner.run(command)
+    runner.run(command, check=not refresh)
 
 
 def cleanup_local_tun(runner: CommandRunner, server: str | None = None) -> None:

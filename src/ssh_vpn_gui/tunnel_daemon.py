@@ -7,7 +7,7 @@ import time
 import pexpect
 
 from .ssh_tunnel import _ssh_command
-from .system import load_tunnel_state, remote_setup_script
+from .system import load_tunnel_state, mark_fail_closed, remote_setup_script
 from .tunnel_watch import is_tun_peer_reachable, should_drop_unresponsive_peer
 
 
@@ -38,7 +38,12 @@ def main(argv: list[str] | None = None) -> int:
         ignore_sighup=True,
     )
 
+    stopping = False
+    ready = False
+
     def stop(_signum: int, _frame: object) -> None:
+        nonlocal stopping
+        stopping = True
         child.close(force=True)
         raise SystemExit(0)
 
@@ -66,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(str(child.after).strip(), flush=True)
             elif index == 3:
                 print("SSH_VPN_READY", flush=True)
+                ready = True
                 break
             elif index == 4:
                 print("SSH authentication failed", file=sys.stderr, flush=True)
@@ -97,6 +103,17 @@ def main(argv: list[str] | None = None) -> int:
         return child.exitstatus or 0
     finally:
         child.close(force=True)
+        if ready and not stopping:
+            _mark_dropped()
+
+
+def _mark_dropped() -> None:
+    # The blackholes armed at connect already hold traffic back; the flag
+    # makes the GUI show that instead of a plain "disconnected".
+    try:
+        mark_fail_closed()
+    except OSError as exc:
+        print(f"could not record the dropped tunnel: {exc}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":
