@@ -1,30 +1,70 @@
 from ssh_vpn_gui import app
 
 
-def test_save_config_persists_checkbox_preferences(monkeypatch, tmp_path) -> None:
+def test_save_config_persists_servers_and_checkboxes(monkeypatch, tmp_path) -> None:
     config_dir = tmp_path / "config"
     config_file = config_dir / "config.json"
     monkeypatch.setattr(app, "CONFIG_DIR", config_dir)
     monkeypatch.setattr(app, "CONFIG_FILE", config_file)
 
     app.save_config(
-        server="203.0.113.10",
-        login="root",
-        password="secret",
+        servers=[
+            {"host": "203.0.113.10", "login": "root", "password": "secret", "notice": "Vultr"},
+            {"host": "198.51.100.4", "login": "ubuntu", "password": "other", "notice": ""},
+        ],
+        selected=1,
         routing=False,
         cascade=True,
         ovpn_path="/tmp/client.ovpn",
     )
 
     assert app.load_saved_config() == {
-        "server": "203.0.113.10",
-        "login": "root",
-        "password": "secret",
+        "servers": [
+            {"host": "203.0.113.10", "login": "root", "password": "secret", "notice": "Vultr"},
+            {"host": "198.51.100.4", "login": "ubuntu", "password": "other", "notice": ""},
+        ],
+        "selected": 1,
         "ovpn_path": "/tmp/client.ovpn",
         "routing": False,
         "cascade": True,
     }
     assert config_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_load_saved_config_migrates_single_server(monkeypatch, tmp_path) -> None:
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        '{"server": "203.0.113.10", "login": "root", "password": "secret", "routing": true}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app, "CONFIG_FILE", config_file)
+
+    loaded = app.load_saved_config()
+
+    assert loaded["servers"] == [
+        {"host": "203.0.113.10", "login": "root", "password": "secret", "notice": ""}
+    ]
+    assert loaded["selected"] == 0
+    assert loaded["routing"] is True
+
+
+def test_upsert_replaces_same_login_and_remove_keeps_neighbor() -> None:
+    servers, index = app.upsert_server([], "203.0.113.10", "root", "secret", "Vultr")
+    servers, index = app.upsert_server(servers, "198.51.100.4", "ubuntu", "other", "home")
+    servers, index = app.upsert_server(servers, "203.0.113.10", "root", "new-secret", "Vultr")
+
+    assert index == 0
+    assert servers[0]["password"] == "new-secret"
+    assert servers[0]["notice"] == "Vultr"
+    assert app.server_label(servers[0]) == "203.0.113.10 Vultr"
+    assert len(servers) == 2
+
+    servers, index = app.remove_server(servers, 0)
+    assert index == 0
+    assert servers == [
+        {"host": "198.51.100.4", "login": "ubuntu", "password": "other", "notice": "home"}
+    ]
+    assert app.server_label(servers[0]) == "198.51.100.4 home"
 
 
 def test_reap_disconnect_uses_remote_cleanup_when_credentials_exist() -> None:

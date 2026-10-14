@@ -1,3 +1,34 @@
+ssh-vpn-gui (0.2.35) unstable; urgency=medium
+
+  * Put the server menu and the + / − buttons back on one row. The menu
+    shows the whole "IP Notice", and + still works with no servers.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Wed, 14 Oct 2026 13:40:00 +0300
+
+ssh-vpn-gui (0.2.34) unstable; urgency=medium
+
+  * Keep Add working after the last server is removed. An empty combo
+    disables itself and was disabling the button inside it.
+  * Show the full "IP Notice" on the server row instead of cutting it
+    off beside the buttons.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Wed, 14 Oct 2026 12:52:00 +0300
+
+ssh-vpn-gui (0.2.33) unstable; urgency=medium
+
+  * Add a Notice field when saving a server and show it in the menu
+    as "IP Notice".
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Wed, 14 Oct 2026 12:42:00 +0300
+
+ssh-vpn-gui (0.2.32) unstable; urgency=medium
+
+  * Choose a saved server from a menu. Each entry keeps its own login
+    and password. Add and Remove replace the three credential fields.
+    An older config.json with one server is imported on launch.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Wed, 14 Oct 2026 12:40:00 +0300
+
 ssh-vpn-gui (0.2.31) unstable; urgency=medium
 
   * After eight failed reconnects keep trying every minute. Fail-closed

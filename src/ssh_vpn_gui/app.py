@@ -143,6 +143,65 @@ class RoutingEditorWindow(Gtk.Window):
         return False
 
 
+class ServerEditorWindow(Gtk.Window):
+    def __init__(self, parent: "SshVpnWindow") -> None:
+        super().__init__(title="Add server", transient_for=parent, modal=True)
+        self.parent_window = parent
+        self.set_default_size(460, 340)
+
+        cancel_button = Gtk.Button(label="Cancel")
+        cancel_button.connect("clicked", lambda _button: self.close())
+        self.save_button = Gtk.Button(label="Save")
+        self.save_button.add_css_class("suggested-action")
+        self.save_button.connect("clicked", self._on_save_clicked)
+
+        header = Gtk.HeaderBar()
+        header.pack_start(cancel_button)
+        header.pack_end(self.save_button)
+        self.set_titlebar(header)
+
+        _host_row, self.host_entry = _entry_row("Server")
+        self.host_entry.set_placeholder_text("203.0.113.10")
+        _notice_row, self.notice_entry = _entry_row("Notice")
+        self.notice_entry.set_placeholder_text("Vultr")
+        _login_row, self.login_entry = _entry_row("Login")
+        self.login_entry.set_text("root")
+        _password_row, self.password_entry = _entry_row("Password", password=True)
+
+        self.message = Gtk.Label(label="The same login on the same host replaces the saved password.")
+        self.message.set_xalign(0)
+        self.message.set_wrap(True)
+        self.message.add_css_class("dim-label")
+
+        group = Adw.PreferencesGroup()
+        group.add(_host_row)
+        group.add(_notice_row)
+        group.add(_login_row)
+        group.add(_password_row)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.set_margin_top(16)
+        content.set_margin_bottom(16)
+        content.set_margin_start(16)
+        content.set_margin_end(16)
+        content.append(group)
+        content.append(self.message)
+        self.set_child(content)
+        self.host_entry.grab_focus()
+
+    def _on_save_clicked(self, _button: Gtk.Button) -> None:
+        error = self.parent_window.add_server(
+            self.host_entry.get_text(),
+            self.login_entry.get_text(),
+            self.password_entry.get_text(),
+            self.notice_entry.get_text(),
+        )
+        if error:
+            self.message.set_text(error)
+            return
+        self.close()
+
+
 class SshVpnWindow(Adw.ApplicationWindow):
     def __init__(self, application: Adw.Application) -> None:
         super().__init__(application=application, title="SSH VPN")
@@ -169,12 +228,26 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self._login1_connection: Gio.DBusConnection | None = None
 
         saved_config = load_saved_config()
-        server_row, self.server_entry = _entry_row("Remote server IP address")
-        login_row, self.login_entry = _entry_row("Remote login")
-        password_row, self.password_entry = _entry_row("Remote password", password=True)
-        self.server_entry.set_text(saved_config.get("server", ""))
-        self.login_entry.set_text(saved_config.get("login", "root"))
-        self.password_entry.set_text(saved_config.get("password", ""))
+        self.servers: list[dict[str, str]] = list(saved_config.get("servers") or [])
+        self._suppress_server_change = False
+        self.server_model = Gtk.StringList()
+        self.server_dropdown = Gtk.DropDown.new(self.server_model, None)
+        self.server_dropdown.set_factory(_full_text_factory())
+        self.server_dropdown.set_valign(Gtk.Align.CENTER)
+        self.server_dropdown.connect("notify::selected", self._on_server_selected)
+        self.add_server_button = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Add server")
+        self.add_server_button.set_valign(Gtk.Align.CENTER)
+        self.add_server_button.connect("clicked", self._on_add_server_clicked)
+        self.remove_server_button = Gtk.Button(icon_name="list-remove-symbolic", tooltip_text="Remove server")
+        self.remove_server_button.set_valign(Gtk.Align.CENTER)
+        self.remove_server_button.connect("clicked", self._on_remove_server_clicked)
+        # Not AdwComboRow: it ellipsizes the value and turns insensitive
+        # when the list is empty, which would also disable "+".
+        self.server_row = Adw.ActionRow(title="Server")
+        self.server_row.add_suffix(self.server_dropdown)
+        self.server_row.add_suffix(self.add_server_button)
+        self.server_row.add_suffix(self.remove_server_button)
+        self._refresh_server_list(select=int(saved_config.get("selected", 0) or 0))
 
         self.routing_switch = Gtk.CheckButton()
         self.routing_switch.set_valign(Gtk.Align.CENTER)
@@ -259,9 +332,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self.status_scroller.set_child(self.status)
 
         group = Adw.PreferencesGroup(title="Connection")
-        group.add(server_row)
-        group.add(login_row)
-        group.add(password_row)
+        group.add(self.server_row)
         group.add(routing_row)
         group.add(cascade_row)
         group.add(self.ovpn_row)
@@ -293,7 +364,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
 
     def _on_routing_rules_saved(self) -> None:
         if self.connected and self.routing_switch.get_active() and not self.busy:
-            server = self.server_entry.get_text().strip()
+            server, _login, _password = self._credentials()
             args = ["routing-on", "--server", server]
             self._run_helper(args, password=None, busy_text="Applying updated routing rules...")
         else:
@@ -304,11 +375,9 @@ class SshVpnWindow(Adw.ApplicationWindow):
             self._auto_reconnects = 0
             self._auto_connect_in_flight = False
             self._cancel_slow_reconnect()
-        server = self.server_entry.get_text().strip()
-        login = self.login_entry.get_text().strip()
-        password = self.password_entry.get_text()
+        server, login, password = self._credentials()
         if not server or not login or not password:
-            self._set_status("Enter remote server IP address, login, and password.")
+            self._set_status("Add a server with a login and password, then choose it.")
             return
 
         cascade = self.cascade_switch.get_active()
@@ -332,9 +401,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self._auto_connect_in_flight = False
         self._cancel_slow_reconnect()
         args = ["disconnect"]
-        server = self.server_entry.get_text().strip()
-        login = self.login_entry.get_text().strip()
-        password = self.password_entry.get_text()
+        server, login, password = self._credentials()
         if server and login and password:
             self._save_config()
             args.extend(["--server", server, "--login", login])
@@ -353,9 +420,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
 
     def _start_exit_restore(self) -> None:
         args = ["disconnect"]
-        server = self.server_entry.get_text().strip()
-        login = self.login_entry.get_text().strip()
-        password = self.password_entry.get_text()
+        server, login, password = self._credentials()
         if server and login and password:
             args.extend(["--server", server, "--login", login])
         else:
@@ -381,7 +446,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
 
     def _on_diagnose_clicked(self, _button: Gtk.Button) -> None:
         args = ["diagnose"]
-        server = self.server_entry.get_text().strip()
+        server, _login, _password = self._credentials()
         if server:
             args.extend(["--server", server])
         self._run_helper(args, password=None, busy_text="Running diagnostics...")
@@ -393,7 +458,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
         if not self.connected:
             self._save_config()
             return
-        server = self.server_entry.get_text().strip()
+        server, _login, _password = self._credentials()
         args = ["routing-on" if state else "routing-off"]
         if server:
             args.extend(["--server", server])
@@ -454,22 +519,83 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self.ovpn_row.set_sensitive(not self.busy)
 
     def _save_config(self) -> None:
+        selected = self._selected_index()
         save_config(
-            server=self.server_entry.get_text().strip(),
-            login=self.login_entry.get_text().strip(),
-            password=self.password_entry.get_text(),
+            servers=self.servers,
+            selected=0 if selected is None else selected,
             routing=self.routing_switch.get_active(),
             cascade=self.cascade_switch.get_active(),
             ovpn_path=self.ovpn_path,
         )
 
+    def _credentials(self) -> tuple[str, str, str]:
+        index = self._selected_index()
+        if index is None:
+            return "", "", ""
+        server = self.servers[index]
+        return server["host"], server["login"], server["password"]
+
+    def _selected_index(self) -> int | None:
+        if not self.servers:
+            return None
+        index = self.server_dropdown.get_selected()
+        if index == Gtk.INVALID_LIST_POSITION or index >= len(self.servers):
+            return None
+        return int(index)
+
+    def _refresh_server_list(self, *, select: int) -> None:
+        self._suppress_server_change = True
+        try:
+            self.server_model.splice(
+                0,
+                self.server_model.get_n_items(),
+                [server_label(server) for server in self.servers],
+            )
+            if self.servers:
+                self.server_dropdown.set_selected(max(0, min(select, len(self.servers) - 1)))
+                self.server_dropdown.set_visible(True)
+                self.server_row.set_subtitle("")
+            else:
+                self.server_dropdown.set_visible(False)
+                self.server_row.set_subtitle("No servers yet")
+        finally:
+            self._suppress_server_change = False
+        editable = not self.busy and not self.connected
+        self.remove_server_button.set_sensitive(editable and bool(self.servers))
+
+    def _on_server_selected(self, _dropdown: Gtk.DropDown, _pspec: GLib.ParamSpec) -> None:
+        if self._suppress_server_change:
+            return
+        self._save_config()
+
+    def _on_add_server_clicked(self, _button: Gtk.Button) -> None:
+        ServerEditorWindow(self).present()
+
+    def add_server(self, host: str, login: str, password: str, notice: str = "") -> str | None:
+        try:
+            self.servers, index = upsert_server(self.servers, host, login, password, notice)
+        except ValueError as exc:
+            return str(exc)
+        self._refresh_server_list(select=index)
+        self._save_config()
+        self._set_status(f"Saved {server_label(self.servers[index])}.")
+        return None
+
+    def _on_remove_server_clicked(self, _button: Gtk.Button) -> None:
+        index = self._selected_index()
+        if index is None:
+            return
+        removed = server_label(self.servers[index])
+        self.servers, next_index = remove_server(self.servers, index)
+        self._refresh_server_list(select=next_index)
+        self._save_config()
+        self._set_status(f"Removed {removed}.")
+
     def _apply_cascade(self, enabled: bool, *, replacing: bool = False) -> None:
-        server = self.server_entry.get_text().strip()
-        login = self.login_entry.get_text().strip()
-        password = self.password_entry.get_text()
+        server, login, password = self._credentials()
         if not server or not login or not password:
             self._set_switch_active(self.cascade_switch, not enabled)
-            self._set_status("Remote server, login, and password are required.")
+            self._set_status("Choose a saved server.")
             return
 
         args = ["cascade-on" if enabled else "cascade-off", "--server", server, "--login", login]
@@ -779,10 +905,11 @@ class SshVpnWindow(Adw.ApplicationWindow):
             return
         self._reaping = True
         self._pending_reconnect = reconnect
+        server, login, password = self._credentials()
         args, password = disconnect_args_for_reap(
-            server=self.server_entry.get_text().strip(),
-            login=self.login_entry.get_text().strip(),
-            password=self.password_entry.get_text(),
+            server=server,
+            login=login,
+            password=password,
             routing=self.routing_switch.get_active(),
         )
         remote = password is not None
@@ -858,9 +985,9 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self.cascade_switch.set_sensitive(available)
         self.ovpn_row.set_sensitive(available)
         credentials_editable = available and not self.connected
-        self.server_entry.set_sensitive(credentials_editable)
-        self.login_entry.set_sensitive(credentials_editable)
-        self.password_entry.set_sensitive(credentials_editable)
+        self.server_dropdown.set_sensitive(credentials_editable)
+        self.add_server_button.set_sensitive(credentials_editable)
+        self.remove_server_button.set_sensitive(credentials_editable and bool(self.servers))
         self._update_exit_restore_button()
 
     def _update_exit_restore_button(self) -> None:
@@ -983,16 +1110,114 @@ def _entry_row(title: str, *, password: bool = False) -> tuple[Adw.ActionRow, Gt
     return row, entry
 
 
+def _full_text_factory() -> Gtk.SignalListItemFactory:
+    factory = Gtk.SignalListItemFactory()
+    factory.connect("setup", _setup_full_text_item)
+    factory.connect("bind", _bind_full_text_item)
+    return factory
+
+
+def _setup_full_text_item(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
+    item.set_child(Gtk.Label(xalign=0))
+
+
+def _bind_full_text_item(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
+    string = item.get_item()
+    item.get_child().set_text(string.get_string() if string is not None else "")
+
+
+def server_label(server: dict[str, str]) -> str:
+    notice = str(server.get("notice") or "").strip()
+    if notice:
+        return f"{server['host']} {notice}"
+    return server["host"]
+
+
+def normalize_server(item: object) -> dict[str, str] | None:
+    if not isinstance(item, dict):
+        return None
+    host = str(item.get("host") or item.get("server") or "").strip()
+    if not host:
+        return None
+    login = str(item.get("login") or "root").strip() or "root"
+    return {
+        "host": host,
+        "login": login,
+        "password": str(item.get("password") or ""),
+        "notice": str(item.get("notice") or "").strip(),
+    }
+
+
+def servers_from_saved(data: dict) -> tuple[list[dict[str, str]], int]:
+    raw = data.get("servers")
+    servers: list[dict[str, str]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            server = normalize_server(item)
+            if server is not None:
+                servers.append(server)
+    if not servers:
+        legacy = normalize_server(data)
+        if legacy is not None:
+            servers.append(legacy)
+    selected = data.get("selected", 0)
+    try:
+        index = int(selected)
+    except (TypeError, ValueError):
+        index = 0
+    if servers:
+        index = max(0, min(index, len(servers) - 1))
+    else:
+        index = 0
+    return servers, index
+
+
+def upsert_server(
+    servers: list[dict[str, str]], host: str, login: str, password: str, notice: str = ""
+) -> tuple[list[dict[str, str]], int]:
+    cleaned_host = host.strip()
+    cleaned_login = login.strip() or "root"
+    cleaned_notice = notice.strip()
+    if not cleaned_host:
+        raise ValueError("Server address is required.")
+    if not password:
+        raise ValueError("Password is required.")
+    updated = [dict(item) for item in servers]
+    record = {
+        "host": cleaned_host,
+        "login": cleaned_login,
+        "password": password,
+        "notice": cleaned_notice,
+    }
+    for index, item in enumerate(updated):
+        if item["host"] == cleaned_host and item["login"] == cleaned_login:
+            updated[index] = record
+            return updated, index
+    updated.append(record)
+    return updated, len(updated) - 1
+
+
+def remove_server(servers: list[dict[str, str]], index: int) -> tuple[list[dict[str, str]], int]:
+    updated = [dict(item) for item in servers]
+    if 0 <= index < len(updated):
+        del updated[index]
+    if not updated:
+        return [], 0
+    return updated, min(index, len(updated) - 1)
+
+
 def load_saved_config() -> dict:
     try:
         with CONFIG_FILE.open("r", encoding="utf-8") as file:
             data = json.load(file)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
-    result: dict = {}
-    for key in ("server", "login", "password", "ovpn_path"):
-        if key in data:
-            result[key] = str(data[key])
+        return {"servers": [], "selected": 0}
+    if not isinstance(data, dict):
+        return {"servers": [], "selected": 0}
+    servers, selected = servers_from_saved(data)
+    result: dict = {"servers": servers, "selected": selected}
+    if "ovpn_path" in data:
+        result["ovpn_path"] = str(data["ovpn_path"])
     for key in ("routing", "cascade"):
         if key in data:
             result[key] = bool(data[key])
@@ -1001,9 +1226,8 @@ def load_saved_config() -> dict:
 
 def save_config(
     *,
-    server: str,
-    login: str,
-    password: str,
+    servers: list[dict[str, str]],
+    selected: int = 0,
     routing: bool = True,
     cascade: bool = False,
     ovpn_path: str = "",
@@ -1012,9 +1236,8 @@ def save_config(
     CONFIG_FILE.write_text(
         json.dumps(
             {
-                "server": server,
-                "login": login,
-                "password": password,
+                "servers": servers,
+                "selected": selected,
                 "routing": routing,
                 "cascade": cascade,
                 "ovpn_path": ovpn_path,
