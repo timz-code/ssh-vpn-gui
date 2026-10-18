@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 from pathlib import Path
+from typing import Iterable
 import urllib.request
 
 from .system import DATA_DIR
@@ -27,40 +28,71 @@ PRIVATE_NETWORKS = tuple(
 
 
 class GeoIpStore:
-    def __init__(self, path: Path = GEOIP_DB) -> None:
-        self.path = path
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path if path is not None else GEOIP_DB
         self._reader = None
-        self._disabled_reason: str | None = None
 
     def country_code(self, address: str) -> str | None:
         ip = ipaddress.ip_address(address)
         if any(ip in network for network in PRIVATE_NETWORKS):
             return "private"
-        if self._disabled_reason:
-            return None
-        if not self.path.exists():
-            return None
         reader = self._open_reader()
-        record = reader.get(address) if reader else None
-        if not record:
-            return None
-        country = record.get("country") or {}
-        return (country.get("iso_code") or country.get("code") or "").lower() or None
+        return _record_country_code(reader.get(address))
 
     def matches(self, address: str, tags: list[str]) -> bool:
         code = self.country_code(address)
         return code is not None and code.lower() in {tag.lower() for tag in tags}
 
+    def ipv4_networks(self, tags: Iterable[str]) -> dict[str, tuple[ipaddress.IPv4Network, ...]]:
+        """Expand countries once so IP rules do not depend on observing DNS."""
+        requested = {tag.lower() for tag in tags}
+        networks: dict[str, list[ipaddress.IPv4Network]] = {tag: [] for tag in requested}
+        if "private" in requested:
+            networks["private"].extend(PRIVATE_NETWORKS)
+        countries = requested - {"private"}
+        if countries:
+            for network, record in self._open_reader():
+                if network.version != 4:
+                    continue
+                code = _record_country_code(record)
+                if code in countries:
+                    networks[code].append(network)
+            missing = sorted(tag for tag in countries if not networks[tag])
+            if missing:
+                raise RuntimeError(
+                    f"GeoIP database has no IPv4 networks for: {', '.join(missing)}. "
+                    "Check the geoip tags and click 'Update Routing Data'."
+                )
+        return {tag: tuple(ipaddress.collapse_addresses(values)) for tag, values in networks.items()}
+
+    def close(self) -> None:
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+
     def _open_reader(self):
         if self._reader is not None:
             return self._reader
+        if not self.path.exists():
+            raise RuntimeError(
+                f"GeoIP database is missing: {self.path}. Click 'Update Routing Data' before connecting."
+            )
         try:
             import maxminddb  # type: ignore
         except ImportError as exc:
-            self._disabled_reason = "GeoIP MMDB lookup requires python package 'maxminddb'"
-            return None
-        self._reader = maxminddb.open_database(str(self.path))
+            raise RuntimeError("GeoIP MMDB lookup requires the python3-maxminddb package") from exc
+        try:
+            self._reader = maxminddb.open_database(str(self.path))
+        except (OSError, ValueError, maxminddb.InvalidDatabaseError) as exc:
+            raise RuntimeError(
+                f"Cannot read GeoIP database {self.path}: {exc}. Click 'Update Routing Data'."
+            ) from exc
         return self._reader
+
+
+def _record_country_code(record: dict | None) -> str | None:
+    country = (record or {}).get("country") or {}
+    return (country.get("iso_code") or country.get("code") or "").lower() or None
 
 
 def update_geoip(*, dry_run: bool = False) -> list[str]:

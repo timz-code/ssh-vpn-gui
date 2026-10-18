@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from bisect import bisect_right
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import ipaddress
 
-from .routing_config import RoutingConfig
+from .geoip import GeoIpStore, PRIVATE_NETWORKS
+from .routing_config import Action, RoutingConfig
 from .system import (
     CommandRunner,
     KILL_SWITCH_METRIC,
@@ -34,6 +38,13 @@ ROUTE_BATCH_FILE = STATE_DIR / "routes.batch"
 
 
 @dataclass(frozen=True)
+class StaticIpRule:
+    name: str
+    action: Action
+    networks: tuple[ipaddress.IPv4Network, ...]
+
+
+@dataclass(frozen=True)
 class RoutingEngine:
     config: RoutingConfig
     server: str
@@ -47,14 +58,15 @@ class RoutingEngine:
         state has no moment where tunneled traffic can reach the WAN.
         Per-IP proxy routes learned from DNS move to the new tun.
         """
-        runner.write_file(NFT_CONFIG, self._nft_config())
+        ip_rules = self._static_ip_rules()
+        runner.write_file(NFT_CONFIG, self._nft_config(ip_rules))
         runner.run(["nft", "-f", str(NFT_CONFIG)])
         binding = routing_binding()
         runner.run(["ip", "route", "replace", "default", "dev", binding.local_tun, "src", binding.local_address, "table", PROXY_TABLE])
         runner.run(["ip", "route", "replace", "blackhole", "default", "table", PROXY_TABLE, "metric", KILL_SWITCH_METRIC])
         ensure_proxy_rule(runner)
         ipv6_guard_up(runner)
-        restore_dynamic_proxy_routes(runner)
+        restore_dynamic_proxy_routes(runner, ip_rules)
         remove_full_tunnel_routes(runner)
         if not runner.dry_run:
             clear_fail_closed()
@@ -68,35 +80,59 @@ class RoutingEngine:
     def stop(self, runner: CommandRunner) -> None:
         reset_local_routing(runner)
 
-    def add_static_ip_rules(self, runner: CommandRunner) -> None:
-        protected = underlay_ips(self.server)
+    def _static_ip_rules(self) -> list[StaticIpRule]:
+        geoip = GeoIpStore()
+        try:
+            countries = geoip.ipv4_networks(
+                matcher.value
+                for rule in self.config.rules if rule.kind == "ip"
+                for matcher in rule.matchers if matcher.name == "geoip"
+            )
+        finally:
+            geoip.close()
+        compiled = []
         for rule in self.config.rules:
+            if rule.kind != "ip":
+                continue
+            networks = []
             for matcher in rule.matchers:
-                if matcher.name != "ip_cidr":
-                    continue
-                if _cidr_covers(matcher.value, protected):
-                    runner.run(
-                        ["nft", "add", "element", "inet", NFT_TABLE, "direct4", "{", matcher.value, "}"],
-                        check=False,
-                    )
-                    preserve_server_route(runner, self.server)
-                    continue
-                set_name = "direct4" if rule.action == "direct" else "proxy4"
-                runner.run(["nft", "add", "element", "inet", NFT_TABLE, set_name, "{", matcher.value, "}"], check=False)
+                if matcher.name == "geoip":
+                    networks.extend(countries[matcher.value.lower()])
+                elif matcher.name == "ip_cidr":
+                    network = ipaddress.ip_network(matcher.value)
+                    if network.version == 4:
+                        networks.append(network)
+            if networks:
+                compiled.append(StaticIpRule(
+                    name=f"ip_rule_{rule.line_number}",
+                    action=rule.action,
+                    networks=tuple(ipaddress.collapse_addresses(networks)),
+                ))
+        return compiled
 
     def _setup_commands(self) -> list[list[str]]:
         return [["nft", "-f", str(NFT_CONFIG)]]
 
-    def _nft_config(self) -> str:
-        networks = [str(network) for network in _direct_networks()]
+    def _nft_config(self, ip_rules: list[StaticIpRule] | None = None) -> str:
+        if ip_rules is None:
+            ip_rules = self._static_ip_rules()
+        networks = list(_direct_networks())
         try:
-            ipaddress.ip_address(self.server)
+            server_ip = ipaddress.IPv4Address(self.server)
         except ValueError:
             pass
         else:
-            networks.append(self.server)
-        direct_elements = ", ".join(networks)
-        mark_rules = "\n".join(f"    {rule}" for rule in self._mark_rules())
+            networks.append(ipaddress.ip_network(f"{server_ip}/32"))
+        direct_elements = ", ".join(str(network) for network in ipaddress.collapse_addresses(networks))
+        mark_rules = "\n".join(f"    {rule}" for rule in self._mark_rules(ip_rules))
+        static_sets = "\n\n".join(
+            f"  set {rule.name} {{\n"
+            "    type ipv4_addr;\n"
+            "    flags interval;\n"
+            f"    elements = {{ {', '.join(str(network) for network in rule.networks)} }};\n"
+            "  }"
+            for rule in ip_rules
+        )
         binding = routing_binding()
         return f"""
 add table inet {NFT_TABLE}
@@ -112,6 +148,8 @@ table inet {NFT_TABLE} {{
     type ipv4_addr;
     flags interval,timeout;
   }}
+
+{static_sets}
 
   chain mark_output {{
     type route hook output priority mangle; policy accept;
@@ -131,14 +169,18 @@ table inet {NFT_TABLE} {{
 }}
 """.strip() + "\n"
 
-    def _mark_rules(self) -> list[str]:
+    def _mark_rules(self, ip_rules: list[StaticIpRule]) -> list[str]:
         rules = [
             "udp dport 53 return;",
             "tcp dport 53 return;",
             f"ip daddr {self.server} return;",
             *[f"ip daddr {upstream} return;" for upstream in DOT_UPSTREAMS],
-            "ip daddr @direct4 return;",
+            f"ip daddr {{ {', '.join(str(network) for network in _direct_networks())} }} return;",
         ]
+        for rule in ip_rules:
+            action = "return;" if rule.action == "direct" else f"meta mark set {PROXY_MARK} return;"
+            rules.append(f"ip daddr @{rule.name} {action}")
+        rules.append("ip daddr @direct4 return;")
         if self.config.default == "proxy":
             rules.append(f"meta mark set {PROXY_MARK};")
         else:
@@ -174,6 +216,7 @@ def add_resolved_ips(runner: CommandRunner, action: str, addresses: list[str], t
             else:
                 runner.run(["ip", "route", "del", "blackhole", f"{ip}/32", "metric", KILL_SWITCH_METRIC], check=False)
                 runner.run(["ip", "route", "del", f"{ip}/32"], check=False)
+                _forget_proxy_route(runner, str(ip))
 
 
 def reset_local_routing(runner: CommandRunner) -> None:
@@ -254,22 +297,35 @@ def cleanup_dynamic_proxy_routes(runner: CommandRunner) -> None:
     PROXY_ROUTES_FILE.unlink(missing_ok=True)
 
 
-def restore_dynamic_proxy_routes(runner: CommandRunner) -> None:
+def restore_dynamic_proxy_routes(runner: CommandRunner, ip_rules: list[StaticIpRule] | None = None) -> None:
     if runner.dry_run:
         runner.commands.append(f"restore routes from {PROXY_ROUTES_FILE}")
         return
-    binding = routing_binding()
-    _route_batch(
-        runner,
-        [
-            line
-            for address in _recorded_proxy_routes()
-            for line in (
-                f"route replace {address}/32 dev {binding.local_tun} src {binding.local_address}",
-                f"route replace blackhole {address}/32 metric {KILL_SWITCH_METRIC}",
-            )
-        ],
-    )
+    with _proxy_routes_lock():
+        binding = routing_binding()
+        recorded = _recorded_proxy_routes()
+        direct = {address for address in recorded if _static_ip_action(address, ip_rules or []) == "direct"}
+        proxy = [address for address in recorded if address not in direct]
+        _route_batch(
+            runner,
+            [
+                line
+                for address in recorded if address in direct
+                for line in (
+                    f"route del blackhole {address}/32 metric {KILL_SWITCH_METRIC}",
+                    f"route del {address}/32",
+                )
+            ] + [
+                line
+                for address in proxy
+                for line in (
+                    f"route replace {address}/32 dev {binding.local_tun} src {binding.local_address}",
+                    f"route replace blackhole {address}/32 metric {KILL_SWITCH_METRIC}",
+                )
+            ],
+        )
+        if direct:
+            runner.write_file(PROXY_ROUTES_FILE, "".join(f"{address}\n" for address in proxy))
 
 
 def _recorded_proxy_routes() -> list[str]:
@@ -298,38 +354,40 @@ def _record_proxy_route(runner: CommandRunner, address: str) -> None:
     if runner.dry_run:
         runner.commands.append(f"record proxy route {address}")
         return
+    with _proxy_routes_lock():
+        existing = set(PROXY_ROUTES_FILE.read_text(encoding="utf-8").splitlines()) if PROXY_ROUTES_FILE.exists() else set()
+        if address not in existing:
+            with PROXY_ROUTES_FILE.open("a", encoding="utf-8") as file:
+                file.write(address + "\n")
+
+
+def _forget_proxy_route(runner: CommandRunner, address: str) -> None:
+    if runner.dry_run:
+        return
+    with _proxy_routes_lock():
+        recorded = _recorded_proxy_routes()
+        if address in recorded:
+            runner.write_file(PROXY_ROUTES_FILE, "".join(f"{item}\n" for item in recorded if item != address))
+
+
+@contextmanager
+def _proxy_routes_lock():
     PROXY_ROUTES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    existing = set(PROXY_ROUTES_FILE.read_text(encoding="utf-8").splitlines()) if PROXY_ROUTES_FILE.exists() else set()
-    if address not in existing:
-        with PROXY_ROUTES_FILE.open("a", encoding="utf-8") as file:
-            file.write(address + "\n")
+    with PROXY_ROUTES_FILE.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
-def _cidr_covers(value: str, addresses: set[str]) -> bool:
-    try:
-        network = ipaddress.ip_network(value, strict=False)
-    except ValueError:
-        return False
-    for address in addresses:
-        try:
-            if ipaddress.ip_address(address) in network:
-                return True
-        except ValueError:
-            continue
-    return False
+def _static_ip_action(address: str, rules: list[StaticIpRule]) -> Action | None:
+    ip = ipaddress.IPv4Address(address)
+    if any(ip in network for network in _direct_networks()):
+        return "direct"
+    for rule in rules:
+        index = bisect_right(rule.networks, int(ip), key=lambda network: int(network.network_address)) - 1
+        if index >= 0 and ip in rule.networks[index]:
+            return rule.action
+    return None
 
 
 def _direct_networks() -> tuple[ipaddress.IPv4Network, ...]:
-    return tuple(
-        ipaddress.ip_network(network)
-        for network in (
-            "0.0.0.0/8",
-            "10.0.0.0/8",
-            "127.0.0.0/8",
-            "169.254.0.0/16",
-            "172.16.0.0/12",
-            "192.168.0.0/16",
-            "224.0.0.0/4",
-            "240.0.0.0/4",
-        )
-    )
+    return PRIVATE_NETWORKS

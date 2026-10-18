@@ -1,6 +1,10 @@
 from dataclasses import dataclass, field
+import ipaddress
 import subprocess
 
+import pytest
+
+from ssh_vpn_gui.geoip import PRIVATE_NETWORKS
 from ssh_vpn_gui.routing_config import parse_routing_text
 from ssh_vpn_gui.routing_engine import (
     RoutingEngine,
@@ -10,6 +14,7 @@ from ssh_vpn_gui.routing_engine import (
     let_server_through,
     reset_local_routing,
     restore_dynamic_proxy_routes,
+    _static_ip_action,
 )
 from ssh_vpn_gui.system import CommandRunner, TunnelBinding
 
@@ -22,6 +27,18 @@ TUN4_BINDING = TunnelBinding(
     cidr="10.255.8.0/30",
     server="192.168.50.2",
 )
+
+
+@pytest.fixture
+def country_networks(monkeypatch):
+    available = {
+        "private": PRIVATE_NETWORKS,
+        "ru": (ipaddress.ip_network("5.255.255.0/24"),),
+    }
+    monkeypatch.setattr(
+        "ssh_vpn_gui.routing_engine.GeoIpStore.ipv4_networks",
+        lambda _self, tags: {tag.lower(): available[tag.lower()] for tag in tags},
+    )
 
 
 @dataclass
@@ -37,7 +54,7 @@ class RecordingRunner(CommandRunner):
         self.files[path] = content
 
 
-def test_routing_engine_uses_marked_table_without_forced_default_routes(monkeypatch) -> None:
+def test_routing_engine_uses_marked_table_without_forced_default_routes(monkeypatch, country_networks) -> None:
     monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: None)
     routing = parse_routing_text(
         """
@@ -292,9 +309,82 @@ def test_add_resolved_ips_skips_tun_routes_when_fail_closed(monkeypatch) -> None
 def test_static_proxy_rule_cannot_steal_the_ssh_server(monkeypatch) -> None:
     monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: None)
     routing = parse_routing_text("default: proxy\nip(192.168.50.2)->proxy\n")
-    runner = CommandRunner(dry_run=True)
+    nft = RoutingEngine(config=routing, server="192.168.50.2")._nft_config()
 
-    RoutingEngine(config=routing, server="192.168.50.2").add_static_ip_rules(runner)
+    assert nft.index("ip daddr 192.168.50.2 return;") < nft.index("ip daddr @ip_rule_2 meta mark set 2023 return;")
 
-    assert not any("proxy4 { 192.168.50.2" in command for command in runner.commands)
-    assert any("direct4 { 192.168.50.2" in command for command in runner.commands)
+
+def test_geoip_private_and_ru_install_permanent_ip_rules_without_dns(country_networks) -> None:
+    engine = RoutingEngine(
+        parse_routing_text("default: proxy\nip(geoip:private, geoip:ru)->direct\n"),
+        server="203.0.113.10",
+    )
+    rules = engine._static_ip_rules()
+    nft = engine._nft_config(rules)
+
+    assert _static_ip_action("5.255.255.77", rules) == "direct"
+    assert _static_ip_action("100.64.0.1", rules) == "direct"
+    assert _static_ip_action("8.8.8.8", rules) is None
+    static_set = nft.split("set ip_rule_2 {", 1)[1].split("\n  }", 1)[0]
+    assert "5.255.255.0/24" in static_set
+    assert "100.64.0.0/10" in static_set
+    assert "flags interval;" in static_set
+    assert "timeout" not in static_set
+    assert nft.index("ip daddr @ip_rule_2 return;") < nft.index("ip daddr @direct4 return;")
+
+
+def test_static_ip_rules_keep_first_match_precedence(country_networks) -> None:
+    engine = RoutingEngine(
+        parse_routing_text("default: proxy\nip(5.255.255.0/28)->proxy\nip(geoip:ru)->direct\n"),
+        server="203.0.113.10",
+    )
+    rules = engine._static_ip_rules()
+    nft = engine._nft_config(rules)
+
+    assert _static_ip_action("5.255.255.1", rules) == "proxy"
+    assert _static_ip_action("5.255.255.40", rules) == "direct"
+    assert nft.index("ip daddr @ip_rule_2 meta mark set 2023 return;") < nft.index("ip daddr @ip_rule_3 return;")
+
+
+def test_rule_reload_removes_old_proxy_routes_for_geoip_direct(monkeypatch, tmp_path, country_networks) -> None:
+    recorded = tmp_path / "proxy-routes.txt"
+    recorded.write_text("5.255.255.77\n1.2.3.4\n", encoding="utf-8")
+    batch = tmp_path / "routes.batch"
+    monkeypatch.setattr("ssh_vpn_gui.routing_engine.PROXY_ROUTES_FILE", recorded)
+    monkeypatch.setattr("ssh_vpn_gui.routing_engine.ROUTE_BATCH_FILE", batch)
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: TUN4_BINDING)
+    runner = RecordingRunner()
+    rules = RoutingEngine(
+        parse_routing_text("ip(geoip:private, geoip:ru)->direct"), server="192.168.50.2"
+    )._static_ip_rules()
+
+    restore_dynamic_proxy_routes(runner, rules)
+
+    assert "route del blackhole 5.255.255.77/32 metric 4095\nroute del 5.255.255.77/32\n" in runner.files[batch]
+    assert "route replace 5.255.255.77/32" not in runner.files[batch]
+    assert "route replace 1.2.3.4/32 dev tun4" in runner.files[batch]
+    assert runner.files[recorded] == "1.2.3.4\n"
+
+
+def test_direct_dns_answer_is_not_restored_as_proxy_later(monkeypatch, tmp_path) -> None:
+    recorded = tmp_path / "proxy-routes.txt"
+    recorded.write_text("5.255.255.77\n1.2.3.4\n", encoding="utf-8")
+    monkeypatch.setattr("ssh_vpn_gui.routing_engine.PROXY_ROUTES_FILE", recorded)
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: TUN4_BINDING)
+    runner = RecordingRunner()
+
+    add_resolved_ips(runner, "direct", ["5.255.255.77"], 60)
+
+    assert runner.files[recorded] == "1.2.3.4\n"
+
+
+def test_missing_geoip_database_fails_before_modifying_routing(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("ssh_vpn_gui.geoip.GEOIP_DB", tmp_path / "missing.mmdb")
+    runner = RecordingRunner()
+    engine = RoutingEngine(parse_routing_text("ip(geoip:ru)->direct"), "203.0.113.10")
+
+    with pytest.raises(RuntimeError, match="Update Routing Data"):
+        engine.start(runner)
+
+    assert runner.commands == []
+    assert runner.files == {}

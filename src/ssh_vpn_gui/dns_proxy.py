@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import select
+import shutil
 import signal
 import socket
 import ssl
@@ -26,7 +27,7 @@ UPSTREAMS = (("1.1.1.1", 853), ("9.9.9.9", 853))
 def start_dns_proxy(routing_file: Path, *, dry_run: bool = False) -> list[str]:
     command = [sys.executable, "-m", "ssh_vpn_gui.dns_proxy", str(routing_file)]
     if dry_run:
-        return [" ".join(command)]
+        return [" ".join(command), *_flush_system_dns_cache(dry_run=True)]
 
     stop_dns_proxy(dry_run=False)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -37,7 +38,26 @@ def start_dns_proxy(routing_file: Path, *, dry_run: bool = False) -> list[str]:
         log.close()
         raise RuntimeError(f"DNS proxy exited immediately: {_read_tail(DNS_LOG)}")
     DNS_PID.write_text(str(process.pid), encoding="utf-8")
-    return [f"started DNS classifier pid {process.pid}"]
+    return [f"started DNS classifier pid {process.pid}", *_flush_system_dns_cache()]
+
+
+def _flush_system_dns_cache(*, dry_run: bool = False) -> list[str]:
+    resolver = shutil.which("resolvectl") or shutil.which("systemd-resolve")
+    if resolver is None:
+        return []
+    option = "flush-caches" if Path(resolver).name == "resolvectl" else "--flush-caches"
+    command = [resolver, option]
+    if dry_run:
+        return [" ".join(command)]
+
+    try:
+        completed = subprocess.run(command, text=True, capture_output=True, check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [f"system DNS cache flush failed: {exc}"]
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        return [f"system DNS cache flush failed: {detail or completed.returncode}"]
+    return ["flushed system DNS cache"]
 
 
 def stop_dns_proxy(*, dry_run: bool = False) -> list[str]:

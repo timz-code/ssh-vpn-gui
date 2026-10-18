@@ -114,7 +114,6 @@ def main(argv: list[str] | None = None) -> int:
             _require_server(args.server)
             engine = RoutingEngine(config=config, server=args.server)
             engine.start(runner)
-            engine.add_static_ip_rules(runner)
             messages.extend(start_dns_proxy(routing_file, dry_run=args.dry_run))
             messages.extend(runner.commands)
         elif args.command == "routing-off":
@@ -303,7 +302,6 @@ def _connect(args: argparse.Namespace, config, routing_file: Path, runner: Comma
         preserve_server_route(runner, args.server)
         if not args.no_routing:
             engine.start(runner)
-            engine.add_static_ip_rules(runner)
             messages.extend(start_dns_proxy(routing_file, dry_run=args.dry_run))
         else:
             setup_full_tunnel_routes(runner)

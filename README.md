@@ -51,6 +51,8 @@ your normal connection ──▶ Internet
 - In rule-based mode, an nftables table marks packets for `proxy`
   destinations and policy routing sends them into the tunnel. Everything else
   uses your normal default route, which the app never rewrites.
+- IP and GeoIP rules are loaded into nftables when routing is applied, so
+  they also cover cached addresses and connections made without DNS.
 - Outgoing DNS queries are redirected to a local resolver that classifies
   every name with your rules and routes the resolved addresses accordingly.
 - Full-tunnel mode routes `0.0.0.0/1` and `128.0.0.0/1` into the tunnel.
@@ -142,8 +144,14 @@ ip(geoip:hk, geoip:mo)->proxy
 - `proxy` sends matching traffic through the tunnel. `direct` uses your
   normal connection. `default` applies to everything no rule matches.
 - Domain and Geosite rules work on plain DNS lookups, which the app
-  intercepts. A browser's built-in "secure DNS" (DNS over HTTPS) bypasses
-  them, so turn it off if domain rules seem to be ignored.
+  intercepts. Applying routing rules flushes the system DNS cache so cached
+  names are classified again. A browser's built-in "secure DNS" (DNS over
+  HTTPS) bypasses domain rules, so turn it off if domain rules seem to be
+  ignored. IP and GeoIP rules still apply with secure DNS enabled.
+- IP and GeoIP rules match the destination IPv4 address in file order.
+  Country rules require the downloaded GeoIP database; a missing or invalid
+  database produces an error instead of silently ignoring the rules.
+  `geoip:private` is built in, including the `100.64.0.0/10` shared address range.
 - DNS queries go over TLS to Cloudflare, with Quad9 as the fallback, along the
   same path as their domain: `proxy` names are resolved through the tunnel and
   `direct` names over your normal connection. IP and GeoIP rules then apply to

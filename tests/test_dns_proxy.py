@@ -1,4 +1,7 @@
 import socket
+import subprocess
+
+import pytest
 
 from ssh_vpn_gui import dns_proxy
 from ssh_vpn_gui.dns_proxy import DnsClassifier
@@ -86,4 +89,43 @@ def test_dns_query_uses_domain_routing_action(monkeypatch) -> None:
     classifier._resolve_and_classify(b"query")
 
     assert actions == ["direct"]
+
+
+@pytest.mark.parametrize(
+    ("available", "expected"),
+    [("resolvectl", "flush-caches"), ("systemd-resolve", "--flush-caches")],
+)
+def test_dns_cache_flush_supports_both_resolver_commands(monkeypatch, available, expected) -> None:
+    commands = []
+    monkeypatch.setattr(dns_proxy.shutil, "which", lambda name: f"/usr/bin/{name}" if name == available else None)
+    monkeypatch.setattr(
+        dns_proxy.subprocess, "run",
+        lambda command, **_kwargs: commands.append(command) or subprocess.CompletedProcess(command, 0, "", ""),
+    )
+
+    assert dns_proxy._flush_system_dns_cache() == ["flushed system DNS cache"]
+    assert commands == [[f"/usr/bin/{available}", expected]]
+
+
+def test_dns_cache_flush_failure_keeps_helper_stdout_valid_json(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(dns_proxy.shutil, "which", lambda _name: "/usr/bin/resolvectl")
+    monkeypatch.setattr(
+        dns_proxy.subprocess, "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 1, "", "resolver unavailable"),
+    )
+
+    assert dns_proxy._flush_system_dns_cache() == ["system DNS cache flush failed: resolver unavailable"]
+    assert capsys.readouterr().out == ""
+
+
+def test_dns_cache_flush_timeout_is_nonfatal(monkeypatch) -> None:
+    monkeypatch.setattr(dns_proxy.shutil, "which", lambda _name: "/usr/bin/resolvectl")
+
+    def timed_out(command, **kwargs):
+        assert kwargs["timeout"] == 5
+        raise subprocess.TimeoutExpired(command, 5)
+
+    monkeypatch.setattr(dns_proxy.subprocess, "run", timed_out)
+
+    assert dns_proxy._flush_system_dns_cache()[0].startswith("system DNS cache flush failed:")
 

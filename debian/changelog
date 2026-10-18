@@ -1,3 +1,18 @@
+ssh-vpn-gui (0.2.37) unstable; urgency=medium
+
+  * Load IPv4 GeoIP country networks into permanent nftables sets when
+    applying rules, so geoip:ru and other IP rules also work with cached
+    addresses, encrypted DNS and connections made directly to an IP.
+  * Apply IP rules in file order and include the carrier-grade NAT range
+    in the built-in private networks.
+  * Remove stale proxy routes and their blackholes for destinations that
+    new IP rules classify as direct.
+  * Report missing or unreadable GeoIP data before changing routing.
+  * Flush the system resolver cache after starting the DNS classifier,
+    without corrupting helper JSON responses if the flush fails.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Thu, 15 Oct 2026 14:35:26 +0300
+
 ssh-vpn-gui (0.2.36) unstable; urgency=medium
 
   * Depend on polkitd and pkexec instead of the policykit-1 transitional
