@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
@@ -42,6 +43,21 @@ class StaticIpRule:
     name: str
     action: Action
     networks: tuple[ipaddress.IPv4Network, ...]
+
+
+@dataclass(frozen=True)
+class ResolvedIp:
+    """An IPv4 address from a DNS answer and where its traffic goes.
+
+    static: a GeoIP or CIDR rule matched the address. mark_output checks
+    those sets before direct4 and proxy4, so the dynamic sets cannot change
+    its mark.
+    """
+
+    address: str
+    action: Action
+    timeout: int
+    static: bool = False
 
 
 @dataclass(frozen=True)
@@ -181,42 +197,115 @@ table inet {NFT_TABLE} {{
             action = "return;" if rule.action == "direct" else f"meta mark set {PROXY_MARK} return;"
             rules.append(f"ip daddr @{rule.name} {action}")
         rules.append("ip daddr @direct4 return;")
-        if self.config.default == "proxy":
-            rules.append(f"meta mark set {PROXY_MARK};")
-        else:
+        if proxy_set_used(self.config):
             rules.append(f"ip daddr @proxy4 meta mark set {PROXY_MARK};")
+        else:
+            rules.append(f"meta mark set {PROXY_MARK};")
         return rules
 
 
-def add_resolved_ips(runner: CommandRunner, action: str, addresses: list[str], ttl: int) -> None:
-    set_name = "direct4" if action == "direct" else "proxy4"
-    timeout = f"{max(30, min(ttl, 86400))}s"
-    for address in addresses:
+def proxy_set_used(config: RoutingConfig) -> bool:
+    return config.default != "proxy"
+
+
+def apply_resolved_ips(
+    runner: CommandRunner,
+    answers: list[ResolvedIp],
+    *,
+    proxy_set_used: bool,
+    routes_applied: Callable[[], None] = lambda: None,
+) -> list[str]:
+    """Install a batch of DNS answers with one ip run and one nft run.
+
+    Every nft run reads all interval sets of the table, GeoIP ones
+    included, so one run per address falls behind a burst of queries.
+    Routes go first; routes_applied() is called before nft starts. The
+    last answer for an address decides its routes. Returns problems
+    worth logging.
+    """
+    servers = underlay_ips()
+    elements: dict[str, dict[str, int | None]] = {"direct4": {}, "proxy4": {}}
+    pinned: list[str] = []
+    actions: dict[str, Action] = {}
+    for answer in answers:
         try:
-            ip = ipaddress.ip_address(address)
+            address = str(ipaddress.IPv4Address(answer.address))
         except ValueError:
             continue
-        if ip.version == 4:
-            if str(ip) in underlay_ips():
-                runner.run(
-                    ["nft", "add", "element", "inet", NFT_TABLE, "direct4", "{", str(ip), "}"],
-                    check=False,
-                )
-                preserve_server_route(runner, str(ip))
-                continue
-            runner.run(["nft", "add", "element", "inet", NFT_TABLE, set_name, "{", str(ip), "timeout", timeout, "}"], check=False)
-            if action == "proxy":
-                # The set entry expires with the DNS TTL; the /32 pair keeps
-                # an app that caches the address longer off the WAN.
-                if not is_fail_closed():
-                    binding = routing_binding()
-                    runner.run(["ip", "route", "replace", f"{ip}/32", "dev", binding.local_tun, "src", binding.local_address], check=False)
-                runner.run(["ip", "route", "replace", "blackhole", f"{ip}/32", "metric", KILL_SWITCH_METRIC], check=False)
-                _record_proxy_route(runner, str(ip))
-            else:
-                runner.run(["ip", "route", "del", "blackhole", f"{ip}/32", "metric", KILL_SWITCH_METRIC], check=False)
-                runner.run(["ip", "route", "del", f"{ip}/32"], check=False)
-                _forget_proxy_route(runner, str(ip))
+        if address in servers:
+            if not _in_direct_networks(address):
+                elements["direct4"][address] = None
+            if address not in pinned:
+                pinned.append(address)
+            continue
+        if needs_set_element(answer, proxy_set_used=proxy_set_used):
+            items = elements["direct4" if answer.action == "direct" else "proxy4"]
+            items[address] = max(answer.timeout, items.get(address) or 0)
+        actions[address] = answer.action
+    _apply_learned_routes(runner, actions)
+    for server in pinned:
+        preserve_server_route(runner, server)
+    routes_applied()
+    return _add_set_elements(runner, elements)
+
+
+def needs_set_element(answer: ResolvedIp, *, proxy_set_used: bool) -> bool:
+    """Whether mark_output can reach the address in direct4 or proxy4."""
+    # mark_output returns for private networks before it reaches the sets,
+    # and adding a /32 inside a direct4 interval fails.
+    if answer.static or _in_direct_networks(answer.address):
+        return False
+    return answer.action == "direct" or proxy_set_used
+
+
+def _add_set_elements(runner: CommandRunner, elements: dict[str, dict[str, int | None]]) -> list[str]:
+    lines = [
+        f"add element inet {NFT_TABLE} {set_name} {{ {', '.join(_set_element(address, timeout) for address, timeout in items.items())} }}"
+        for set_name, items in elements.items()
+        if items
+    ]
+    if not lines:
+        return []
+    completed = runner.run(["nft", "-f", "-"], check=False, input_text="\n".join(lines) + "\n")
+    if completed is None or completed.returncode == 0:
+        return []
+    # The batch is one transaction: one rejected element drops them all.
+    detail = (completed.stderr or completed.stdout).strip().splitlines()
+    for set_name, items in elements.items():
+        for address, timeout in items.items():
+            runner.run(
+                ["nft", "add", "element", "inet", NFT_TABLE, set_name, "{", _set_element(address, timeout), "}"],
+                check=False,
+            )
+    return [f"nft batch failed, added one by one: {detail[0] if detail else completed.returncode}"]
+
+
+def _set_element(address: str, timeout: int | None) -> str:
+    return address if timeout is None else f"{address} timeout {timeout}s"
+
+
+def _apply_learned_routes(runner: CommandRunner, actions: dict[str, Action]) -> None:
+    if not actions:
+        return
+    binding = routing_binding()
+    tun_routes = not is_fail_closed()
+    lines: list[str] = []
+    for address, action in actions.items():
+        if action == "proxy":
+            # The set entry expires with the DNS TTL; the /32 pair keeps
+            # an app that caches the address longer off the WAN.
+            if tun_routes:
+                lines.append(f"route replace {address}/32 dev {binding.local_tun} src {binding.local_address}")
+            lines.append(f"route replace blackhole {address}/32 metric {KILL_SWITCH_METRIC}")
+        else:
+            lines.append(f"route del blackhole {address}/32 metric {KILL_SWITCH_METRIC}")
+            lines.append(f"route del {address}/32")
+    runner.run(["ip", "-force", "-batch", "-"], check=False, input_text="\n".join(lines) + "\n")
+    _update_proxy_routes(
+        runner,
+        recorded=[address for address, action in actions.items() if action == "proxy"],
+        forgotten={address for address, action in actions.items() if action != "proxy"},
+    )
 
 
 def reset_local_routing(runner: CommandRunner) -> None:
@@ -350,24 +439,22 @@ def _route_batch(runner: CommandRunner, lines: list[str]) -> None:
     runner.run(["ip", "-force", "-batch", str(ROUTE_BATCH_FILE)], check=False)
 
 
-def _record_proxy_route(runner: CommandRunner, address: str) -> None:
+def _update_proxy_routes(runner: CommandRunner, *, recorded: list[str], forgotten: set[str]) -> None:
     if runner.dry_run:
-        runner.commands.append(f"record proxy route {address}")
+        runner.commands.extend(f"record proxy route {address}" for address in recorded)
         return
     with _proxy_routes_lock():
-        existing = set(PROXY_ROUTES_FILE.read_text(encoding="utf-8").splitlines()) if PROXY_ROUTES_FILE.exists() else set()
-        if address not in existing:
-            with PROXY_ROUTES_FILE.open("a", encoding="utf-8") as file:
-                file.write(address + "\n")
-
-
-def _forget_proxy_route(runner: CommandRunner, address: str) -> None:
-    if runner.dry_run:
-        return
-    with _proxy_routes_lock():
-        recorded = _recorded_proxy_routes()
-        if address in recorded:
-            runner.write_file(PROXY_ROUTES_FILE, "".join(f"{item}\n" for item in recorded if item != address))
+        if forgotten:
+            current = _recorded_proxy_routes()
+            kept = [address for address in current if address not in forgotten]
+            if len(kept) != len(current):
+                runner.write_file(PROXY_ROUTES_FILE, "".join(f"{address}\n" for address in kept))
+        if recorded:
+            existing = set(PROXY_ROUTES_FILE.read_text(encoding="utf-8").splitlines()) if PROXY_ROUTES_FILE.exists() else set()
+            new = [address for address in recorded if address not in existing]
+            if new:
+                with PROXY_ROUTES_FILE.open("a", encoding="utf-8") as file:
+                    file.write("".join(f"{address}\n" for address in new))
 
 
 @contextmanager
@@ -391,3 +478,11 @@ def _static_ip_action(address: str, rules: list[StaticIpRule]) -> Action | None:
 
 def _direct_networks() -> tuple[ipaddress.IPv4Network, ...]:
     return PRIVATE_NETWORKS
+
+
+def _in_direct_networks(address: str) -> bool:
+    try:
+        ip = ipaddress.IPv4Address(address)
+    except ValueError:
+        return False
+    return any(ip in network for network in _direct_networks())

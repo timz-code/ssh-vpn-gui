@@ -276,11 +276,15 @@ class CommandRunner:
     dry_run: bool = False
     commands: list[str] = field(default_factory=list)
 
-    def run(self, command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str] | None:
+    def run(
+        self, command: list[str], *, check: bool = True, input_text: str | None = None
+    ) -> subprocess.CompletedProcess[str] | None:
         self.commands.append(" ".join(command))
+        if input_text:
+            self.commands.extend(input_text.splitlines())
         if self.dry_run:
             return None
-        completed = subprocess.run(command, check=False, text=True, capture_output=True)
+        completed = subprocess.run(command, check=False, text=True, capture_output=True, input=input_text)
         if check and completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()
             raise RuntimeError(f"{' '.join(command)} failed: {detail or completed.returncode}")

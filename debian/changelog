@@ -1,3 +1,27 @@
+ssh-vpn-gui (0.2.39) unstable; urgency=medium
+
+  * Fix a CPU storm in rule mode. The DNS classifier started one nft
+    process for every address in every DNS answer, and since 0.2.37
+    every nft run also reads the GeoIP sets in the table. A burst of
+    queries left hundreds of nft processes fighting over the table
+    until the machine stalled. Answers are now applied by one thread in
+    batches: one ip run and at most one nft run per batch, and never two
+    nft runs at once.
+  * Addresses go into direct4 or proxy4 only when mark_output can look
+    them up there: not when a GeoIP or CIDR rule or a private network
+    already decides them, and not into proxy4 when the default is proxy.
+    Their /32 routes are still installed as before.
+  * A repeated answer is not applied again while its entry lasts. Set
+    entries live 60 seconds longer than the DNS TTL asks.
+  * A DNS reply waits, at most 2 seconds, for its routes, and for nft
+    only when it has set entries to add.
+  * The classifier handles at most 128 queries at once and drops the
+    rest for the client to retry, instead of running out of file
+    descriptors. A TCP client that sends nothing is closed after 10
+    seconds.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Tue, 20 Oct 2026 17:45:27 +0300
+
 ssh-vpn-gui (0.2.38) unstable; urgency=medium
 
   * Replace the "Use .ovpn file on remote server" checkbox with a

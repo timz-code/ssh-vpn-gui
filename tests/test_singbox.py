@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import ipaddress
 import subprocess
 
@@ -7,9 +7,10 @@ import pytest
 from ssh_vpn_gui.geoip import PRIVATE_NETWORKS
 from ssh_vpn_gui.routing_config import parse_routing_text
 from ssh_vpn_gui.routing_engine import (
+    ResolvedIp,
     RoutingEngine,
-    add_resolved_ips,
     apply_fail_closed,
+    apply_resolved_ips,
     cleanup_dynamic_proxy_routes,
     let_server_through,
     reset_local_routing,
@@ -45,8 +46,10 @@ def country_networks(monkeypatch):
 class RecordingRunner(CommandRunner):
     files: dict = field(default_factory=dict)
 
-    def run(self, command, *, check=True):
+    def run(self, command, *, check=True, input_text=None):
         self.commands.append(" ".join(command))
+        if input_text:
+            self.commands.extend(input_text.splitlines())
         return subprocess.CompletedProcess(command, 0, "", "")
 
     def write_file(self, path, content):
@@ -155,7 +158,7 @@ def test_reset_local_routing_removes_overlays_without_touching_main_default(monk
     assert not any(command.startswith("ip route add") for command in runner.commands)
 
 
-def test_add_resolved_ips_never_tunnels_the_ssh_server(monkeypatch) -> None:
+def test_resolved_ips_never_tunnel_the_ssh_server(monkeypatch) -> None:
     monkeypatch.setattr(
         "ssh_vpn_gui.system.load_tunnel_state",
         lambda: TunnelBinding(
@@ -169,29 +172,143 @@ def test_add_resolved_ips_never_tunnels_the_ssh_server(monkeypatch) -> None:
             underlay_dev="wlp2s0",
         ),
     )
+    monkeypatch.setattr("ssh_vpn_gui.routing_engine.is_fail_closed", lambda: False)
     runner = CommandRunner(dry_run=True)
 
-    add_resolved_ips(runner, "proxy", ["192.168.50.2", "1.2.3.4"], 60)
-    add_resolved_ips(runner, "direct", ["192.168.50.2"], 60)
+    apply_resolved_ips(
+        runner,
+        [
+            ResolvedIp("192.168.50.2", "proxy", 60),
+            ResolvedIp("1.2.3.4", "proxy", 60),
+            ResolvedIp("192.168.50.2", "direct", 60),
+        ],
+        proxy_set_used=True,
+    )
 
     joined = "\n".join(runner.commands)
-    assert "ip route replace 192.168.50.2/32 dev tun4" not in joined
-    assert "ip route del 192.168.50.2/32" not in joined
+    assert "192.168.50.2/32 dev tun4" not in joined
+    assert "route del 192.168.50.2/32" not in joined
     assert "blackhole 192.168.50.2" not in joined
-    assert "nft add element inet ssh_vpn_gui direct4 { 192.168.50.2 }" in joined
-    assert "ip route replace 1.2.3.4/32 dev tun4 src 10.255.8.1" in joined
-    assert "ip route replace blackhole 1.2.3.4/32 metric 4095" in joined
-    assert "ip route replace 192.168.50.2/32 via 192.168.1.1 dev wlp2s0" in joined
+    assert "192.168.50.2 timeout" not in joined
+    assert "route replace 1.2.3.4/32 dev tun4 src 10.255.8.1" in runner.commands
+    assert "route replace blackhole 1.2.3.4/32 metric 4095" in runner.commands
+    assert "ip route replace 192.168.50.2/32 via 192.168.1.1 dev wlp2s0" in runner.commands
 
 
-def test_add_resolved_ips_direct_drops_the_proxy_route_pair(monkeypatch) -> None:
+def test_public_ssh_server_goes_into_direct4_without_a_timeout(monkeypatch) -> None:
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: replace(TUN4_BINDING, server="203.0.113.10"))
+    runner = CommandRunner(dry_run=True)
+
+    apply_resolved_ips(runner, [ResolvedIp("203.0.113.10", "proxy", 60)], proxy_set_used=True)
+
+    assert "add element inet ssh_vpn_gui direct4 { 203.0.113.10 }" in runner.commands
+    assert "ip route replace 203.0.113.10/32 via <gw> dev <underlay>" in runner.commands
+    assert not any("203.0.113.10/32 dev tun4" in command for command in runner.commands)
+
+
+def test_direct_answer_drops_the_proxy_route_pair(monkeypatch) -> None:
     monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: TUN4_BINDING)
     runner = CommandRunner(dry_run=True)
 
-    add_resolved_ips(runner, "direct", ["5.6.7.8"], 60)
+    apply_resolved_ips(runner, [ResolvedIp("5.6.7.8", "direct", 60)], proxy_set_used=False)
 
-    assert "ip route del blackhole 5.6.7.8/32 metric 4095" in runner.commands
-    assert "ip route del 5.6.7.8/32" in runner.commands
+    assert "route del blackhole 5.6.7.8/32 metric 4095" in runner.commands
+    assert "route del 5.6.7.8/32" in runner.commands
+
+
+def test_a_batch_of_answers_takes_one_nft_run_and_one_ip_run(monkeypatch) -> None:
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: TUN4_BINDING)
+    monkeypatch.setattr("ssh_vpn_gui.routing_engine.is_fail_closed", lambda: False)
+    runner = CommandRunner(dry_run=True)
+    routes_applied_at = []
+
+    apply_resolved_ips(
+        runner,
+        [
+            ResolvedIp("5.6.7.8", "direct", 300),
+            ResolvedIp("5.6.7.9", "direct", 60),
+            ResolvedIp("1.2.3.4", "proxy", 120),
+            ResolvedIp("5.6.7.8", "direct", 90),
+        ],
+        proxy_set_used=True,
+        routes_applied=lambda: routes_applied_at.append(len(runner.commands)),
+    )
+
+    assert runner.commands.count("nft -f -") == 1
+    assert runner.commands.count("ip -force -batch -") == 1
+    assert runner.commands.index("ip -force -batch -") < routes_applied_at[0] <= runner.commands.index("nft -f -")
+    assert "add element inet ssh_vpn_gui direct4 { 5.6.7.8 timeout 300s, 5.6.7.9 timeout 60s }" in runner.commands
+    assert "add element inet ssh_vpn_gui proxy4 { 1.2.3.4 timeout 120s }" in runner.commands
+    assert "route replace 1.2.3.4/32 dev tun4 src 10.255.8.1" in runner.commands
+    assert not any(command.startswith(("nft add", "ip route")) for command in runner.commands)
+
+
+def test_answers_skip_sets_that_cannot_change_the_mark(monkeypatch) -> None:
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: TUN4_BINDING)
+    runner = CommandRunner(dry_run=True)
+
+    apply_resolved_ips(
+        runner,
+        [
+            ResolvedIp("1.2.3.4", "proxy", 60),
+            ResolvedIp("5.255.255.77", "direct", 60, static=True),
+            ResolvedIp("192.168.50.9", "direct", 60),
+        ],
+        proxy_set_used=False,
+    )
+
+    assert not any(command.startswith("nft") for command in runner.commands)
+    assert "route replace blackhole 1.2.3.4/32 metric 4095" in runner.commands
+    assert "route del 5.255.255.77/32" in runner.commands
+    assert "route del 192.168.50.9/32" in runner.commands
+
+
+def test_rejected_nft_batch_retries_each_element(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("ssh_vpn_gui.routing_engine.PROXY_ROUTES_FILE", tmp_path / "proxy-routes.txt")
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: TUN4_BINDING)
+
+    class RejectingRunner(RecordingRunner):
+        def run(self, command, *, check=True, input_text=None):
+            super().run(command, check=check, input_text=input_text)
+            code = 1 if command == ["nft", "-f", "-"] else 0
+            return subprocess.CompletedProcess(command, code, "", "Error: conflicting intervals specified\n")
+
+    runner = RejectingRunner()
+
+    problems = apply_resolved_ips(
+        runner,
+        [ResolvedIp("5.6.7.8", "direct", 60), ResolvedIp("5.6.7.9", "direct", 60)],
+        proxy_set_used=False,
+    )
+
+    assert "nft add element inet ssh_vpn_gui direct4 { 5.6.7.8 timeout 60s }" in runner.commands
+    assert "nft add element inet ssh_vpn_gui direct4 { 5.6.7.9 timeout 60s }" in runner.commands
+    assert problems == ["nft batch failed, added one by one: Error: conflicting intervals specified"]
+
+
+def test_last_answer_for_an_address_decides_its_routes(monkeypatch, tmp_path) -> None:
+    recorded = tmp_path / "proxy-routes.txt"
+    monkeypatch.setattr("ssh_vpn_gui.routing_engine.PROXY_ROUTES_FILE", recorded)
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: TUN4_BINDING)
+    monkeypatch.setattr("ssh_vpn_gui.routing_engine.is_fail_closed", lambda: False)
+    runner = RecordingRunner()
+
+    apply_resolved_ips(
+        runner,
+        [
+            ResolvedIp("5.6.7.8", "proxy", 60),
+            ResolvedIp("5.6.7.8", "direct", 60),
+            ResolvedIp("1.2.3.4", "direct", 60),
+            ResolvedIp("1.2.3.4", "proxy", 60),
+        ],
+        proxy_set_used=True,
+    )
+
+    assert "route del 5.6.7.8/32" in runner.commands
+    assert "route replace 5.6.7.8/32 dev tun4 src 10.255.8.1" not in runner.commands
+    assert "route replace 1.2.3.4/32 dev tun4 src 10.255.8.1" in runner.commands
+    assert "route del 1.2.3.4/32" not in runner.commands
+    assert recorded.read_text(encoding="utf-8") == "1.2.3.4\n"
 
 
 def test_fail_closed_blackholes_proxy_table_and_keeps_underlay(monkeypatch) -> None:
@@ -283,7 +400,7 @@ def test_cleanup_without_learned_routes_runs_nothing(monkeypatch, tmp_path) -> N
     assert runner.commands == []
 
 
-def test_add_resolved_ips_skips_tun_routes_when_fail_closed(monkeypatch) -> None:
+def test_resolved_ips_skip_tun_routes_when_fail_closed(monkeypatch) -> None:
     monkeypatch.setattr(
         "ssh_vpn_gui.system.load_tunnel_state",
         lambda: TunnelBinding(
@@ -298,12 +415,11 @@ def test_add_resolved_ips_skips_tun_routes_when_fail_closed(monkeypatch) -> None
     monkeypatch.setattr("ssh_vpn_gui.routing_engine.is_fail_closed", lambda: True)
     runner = CommandRunner(dry_run=True)
 
-    add_resolved_ips(runner, "proxy", ["1.2.3.4"], 60)
+    apply_resolved_ips(runner, [ResolvedIp("1.2.3.4", "proxy", 60)], proxy_set_used=True)
 
-    joined = "\n".join(runner.commands)
-    assert "nft add element inet ssh_vpn_gui proxy4 { 1.2.3.4" in joined
-    assert "ip route replace 1.2.3.4/32" not in joined
-    assert "ip route replace blackhole 1.2.3.4/32 metric 4095" in joined
+    assert "add element inet ssh_vpn_gui proxy4 { 1.2.3.4 timeout 60s }" in runner.commands
+    assert not any(command.startswith("route replace 1.2.3.4/32") for command in runner.commands)
+    assert "route replace blackhole 1.2.3.4/32 metric 4095" in runner.commands
 
 
 def test_static_proxy_rule_cannot_steal_the_ssh_server(monkeypatch) -> None:
@@ -373,7 +489,7 @@ def test_direct_dns_answer_is_not_restored_as_proxy_later(monkeypatch, tmp_path)
     monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: TUN4_BINDING)
     runner = RecordingRunner()
 
-    add_resolved_ips(runner, "direct", ["5.255.255.77"], 60)
+    apply_resolved_ips(runner, [ResolvedIp("5.255.255.77", "direct", 60)], proxy_set_used=False)
 
     assert runner.files[recorded] == "1.2.3.4\n"
 

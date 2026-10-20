@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+import functools
 import os
 from pathlib import Path
 import select
@@ -16,12 +18,19 @@ import time
 from .geoip import GeoIpStore
 from .geosite import GeositeStore
 from .routing_config import RoutingConfig, parse_routing_file
-from .routing_engine import DNS_PORT, add_resolved_ips
+from .routing_engine import DNS_PORT, ResolvedIp, apply_resolved_ips, needs_set_element, proxy_set_used
 from .system import CommandRunner, PROXY_MARK, STATE_DIR
 
 DNS_PID = STATE_DIR / "dns-proxy.pid"
 DNS_LOG = STATE_DIR / "dns-proxy.log"
 UPSTREAMS = (("1.1.1.1", 853), ("9.9.9.9", 853))
+# Each query holds a DoT socket; the process may open 1024 files.
+MAX_QUERIES = 128
+# Seconds a reply waits for its addresses to reach the sets and routes.
+UPDATE_WAIT = 2.0
+# Set entries live this much longer than the DNS TTL asks, so the same
+# answer within that window needs no new nft run.
+REFRESH_SLACK = 60
 
 
 def start_dns_proxy(routing_file: Path, *, dry_run: bool = False) -> list[str]:
@@ -110,12 +119,99 @@ def main(argv: list[str] | None = None) -> int:
     return server.serve_forever()
 
 
+class ResolvedIpQueue:
+    """Applies DNS answers from one thread, a batch at a time.
+
+    Answers that arrive while nft runs go into the next batch. An address
+    whose set entry and routes already outlive a new answer is not sent
+    again.
+    """
+
+    def __init__(self, runner: CommandRunner, *, proxy_set_used: bool, clock=time.monotonic) -> None:
+        self.runner = runner
+        self.proxy_set_used = proxy_set_used
+        self.clock = clock
+        self._condition = threading.Condition()
+        self._pending: list[ResolvedIp] = []
+        self._route_waiters: list[threading.Event] = []
+        self._set_waiters: list[threading.Event] = []
+        self._applied: dict[str, tuple[str, float]] = {}
+        self._worker: threading.Thread | None = None
+
+    def submit(self, answers: list[ResolvedIp]) -> threading.Event:
+        """Queue answers. The event is set once their routes are in, and
+        their set entries too if mark_output looks them up."""
+        done = threading.Event()
+        with self._condition:
+            now = self.clock()
+            new = [answer for answer in answers if not self._covered(answer, now)]
+            if not new:
+                done.set()
+                return done
+            self._pending.extend(new)
+            if any(needs_set_element(answer, proxy_set_used=self.proxy_set_used) for answer in new):
+                self._set_waiters.append(done)
+            else:
+                self._route_waiters.append(done)
+            if self._worker is None:
+                self._worker = threading.Thread(target=self._run, daemon=True)
+                self._worker.start()
+            self._condition.notify()
+        return done
+
+    def _covered(self, answer: ResolvedIp, now: float) -> bool:
+        applied = self._applied.get(answer.address)
+        return applied is not None and applied[0] == answer.action and applied[1] >= now + answer.timeout
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while not self._pending:
+                    self._condition.wait()
+                batch, self._pending = self._pending, []
+                route_waiters, self._route_waiters = self._route_waiters, []
+                set_waiters, self._set_waiters = self._set_waiters, []
+            try:
+                self._apply(batch, lambda: _set_all(route_waiters))
+            except Exception as exc:
+                print(f"routing update failed: {exc}", flush=True)
+            finally:
+                _set_all(route_waiters)
+                _set_all(set_waiters)
+
+    def _apply(self, batch: list[ResolvedIp], routes_applied) -> None:
+        started = self.clock()
+        problems = apply_resolved_ips(
+            self.runner,
+            [replace(answer, timeout=answer.timeout + REFRESH_SLACK) for answer in batch],
+            proxy_set_used=self.proxy_set_used,
+            routes_applied=routes_applied,
+        )
+        self.runner.commands.clear()
+        for problem in problems:
+            print(problem, flush=True)
+        with self._condition:
+            for answer in batch:
+                self._applied[answer.address] = (answer.action, started + answer.timeout + REFRESH_SLACK)
+            if len(self._applied) > 4096:
+                self._applied = {address: entry for address, entry in self._applied.items() if entry[1] > started}
+
+
+def _set_all(events: list[threading.Event]) -> None:
+    for event in events:
+        event.set()
+
+
 class DnsClassifier:
     def __init__(self, config: RoutingConfig) -> None:
         self.config = config
         self.geosite = GeositeStore()
         self.geoip = GeoIpStore()
         self.runner = CommandRunner(dry_run=False)
+        self.updates = ResolvedIpQueue(self.runner, proxy_set_used=proxy_set_used(config))
+        self.slots = threading.BoundedSemaphore(MAX_QUERIES)
+        self.dropped = 0
+        self.dropped_reported = 0.0
         self.running = True
 
     def serve_forever(self) -> int:
@@ -133,11 +229,37 @@ class DnsClassifier:
             for sock in readable:
                 if sock is udp:
                     packet, address = udp.recvfrom(4096)
-                    threading.Thread(target=self._handle_udp, args=(udp, packet, address), daemon=True).start()
+                    self._spawn(self._handle_udp, udp, packet, address)
                 else:
                     connection, _ = tcp.accept()
-                    threading.Thread(target=self._handle_tcp, args=(connection,), daemon=True).start()
+                    if not self._spawn(self._handle_tcp, connection):
+                        connection.close()
+            self._report_dropped()
         return 0
+
+    def _spawn(self, handler, *args) -> bool:
+        """Run a query in its own thread unless MAX_QUERIES already run.
+
+        A dropped query is retried by the client.
+        """
+        if not self.slots.acquire(blocking=False):
+            self.dropped += 1
+            return False
+        threading.Thread(target=self._run_slot, args=(handler, *args), daemon=True).start()
+        return True
+
+    def _run_slot(self, handler, *args) -> None:
+        try:
+            handler(*args)
+        finally:
+            self.slots.release()
+
+    def _report_dropped(self) -> None:
+        now = time.monotonic()
+        if self.dropped and now - self.dropped_reported >= 10:
+            print(f"busy: dropped {self.dropped} queries", flush=True)
+            self.dropped = 0
+            self.dropped_reported = now
 
     def _handle_udp(self, udp: socket.socket, packet: bytes, address) -> None:
         response = self._safe_resolve(packet)
@@ -145,6 +267,7 @@ class DnsClassifier:
 
     def _handle_tcp(self, connection: socket.socket) -> None:
         with connection:
+            connection.settimeout(10)
             length_data = _read_exact(connection, 2)
             if not length_data:
                 return
@@ -166,16 +289,12 @@ class DnsClassifier:
         action = self._classify_domain(domain) if domain else self.config.default
         response = _dot_query(packet, action)
         addresses, ttl = _answer_addresses(response)
-        direct_addresses: list[str] = []
-        proxy_addresses: list[str] = []
+        timeout = max(30, min(ttl, 86400))
+        answers = []
         for address in addresses:
             ip_action = self._classify_ip(address)
-            if (ip_action or action) == "direct":
-                direct_addresses.append(address)
-            else:
-                proxy_addresses.append(address)
-        add_resolved_ips(self.runner, "direct", direct_addresses, ttl)
-        add_resolved_ips(self.runner, "proxy", proxy_addresses, ttl)
+            answers.append(ResolvedIp(address, ip_action or action, timeout, static=ip_action is not None))
+        self.updates.submit(answers).wait(UPDATE_WAIT)
         print(f"{domain or '?'} -> {action} {addresses}", flush=True)
         return response
 
@@ -218,10 +337,9 @@ def _dot_query(packet: bytes, action: str) -> bytes:
     last_error: Exception | None = None
     for host, port in UPSTREAMS:
         try:
-            context = ssl.create_default_context()
             with _connect_dot_socket(host, port, action) as raw:
                 server_name = "cloudflare-dns.com" if host == "1.1.1.1" else "dns.quad9.net"
-                with context.wrap_socket(raw, server_hostname=server_name) as tls:
+                with _tls_context().wrap_socket(raw, server_hostname=server_name) as tls:
                     tls.settimeout(8)
                     tls.sendall(struct.pack("!H", len(packet)) + packet)
                     length = struct.unpack("!H", _read_exact(tls, 2))[0]
@@ -229,6 +347,11 @@ def _dot_query(packet: bytes, action: str) -> bytes:
         except Exception as exc:
             last_error = exc
     raise RuntimeError(f"DoT query failed: {last_error}")
+
+
+@functools.cache
+def _tls_context() -> ssl.SSLContext:
+    return ssl.create_default_context()
 
 
 def _connect_dot_socket(host: str, port: int, action: str) -> socket.socket:
