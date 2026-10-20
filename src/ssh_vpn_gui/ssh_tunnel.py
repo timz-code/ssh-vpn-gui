@@ -12,9 +12,10 @@ import time
 
 import pexpect
 
+from .cascade import Cascade, remote_cascade_script
 from .system import (
+    CASCADE_BOOTSTRAP_TIMEOUT_SECONDS,
     KNOWN_HOSTS,
-    OVPN_BOOTSTRAP_TIMEOUT_SECONDS,
     STATE_DIR,
     TunnelBinding,
     allocate_tunnel_binding,
@@ -23,16 +24,14 @@ from .system import (
     parse_remote_allocation,
     placeholder_tunnel_binding,
     remote_bootstrap_script,
+    remote_cascade_cleanup_command,
     remote_cleanup_command,
-    remote_ovpn_bootstrap_script,
-    remote_ovpn_cleanup_command,
     remote_setup_script,
     save_tunnel_state,
     update_tunnel_ovpn,
 )
 
 SSH_PID = STATE_DIR / "ssh.pid"
-OVPN_BOOTSTRAP_TIMEOUT = OVPN_BOOTSTRAP_TIMEOUT_SECONDS
 
 
 class SshTunnelError(RuntimeError):
@@ -46,32 +45,16 @@ def start_tunnel(
     *,
     dry_run: bool = False,
     timeout: int = 30,
-    ovpn_b64: str | None = None,
+    cascade: Cascade | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> list[str]:
-    binding = placeholder_tunnel_binding() if dry_run else None
     bootstrap_command = _ssh_command(server, login, remote_bootstrap_script(), with_tun=False)
-    ovpn_command = (
-        _ssh_command(
-            server,
-            login,
-            remote_ovpn_bootstrap_script(ovpn_b64, cidr=binding.cidr if binding else None),
-            with_tun=False,
-        )
-        if ovpn_b64
-        else None
-    )
     if dry_run:
-        tun_command = _ssh_command(
-            server,
-            login,
-            remote_setup_script(binding),
-            binding=binding,
-        )
-        commands = [" ".join(shlex.quote(part) for part in bootstrap_command)]
-        if ovpn_command is not None:
-            commands.append(" ".join(shlex.quote(part) for part in ovpn_command))
-        commands.append(" ".join(shlex.quote(part) for part in tun_command))
+        binding = placeholder_tunnel_binding()
+        commands = [_quoted(bootstrap_command)]
+        if cascade is not None:
+            commands.append(_quoted(_cascade_command(server, login, cascade, binding)))
+        commands.append(_quoted(_ssh_command(server, login, remote_setup_script(binding), binding=binding)))
         return commands
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -94,25 +77,8 @@ def start_tunnel(
         f"using {binding.local_tun} <-> {binding.remote_tun} "
         f"({binding.local_address} <-> {binding.remote_address})"
     )
-    if ovpn_b64:
-        ovpn_command = _ssh_command(
-            server,
-            login,
-            remote_ovpn_bootstrap_script(ovpn_b64, cidr=binding.cidr),
-            with_tun=False,
-        )
-        ovpn_messages = _run_password_ssh(
-            ovpn_command,
-            password,
-            timeout=OVPN_BOOTSTRAP_TIMEOUT,
-            success_message="remote OpenVPN cascade ready",
-            on_progress=on_progress,
-        )
-        messages.extend(ovpn_messages)
-        ovpn_dev = parse_remote_allocation("\n".join(ovpn_messages)).get("ovpn_dev")
-        if ovpn_dev:
-            update_tunnel_ovpn(ovpn_dev)
-            messages.append(f"remote OpenVPN device {ovpn_dev}")
+    if cascade is not None:
+        messages.extend(_start_cascade(server, login, password, cascade, binding, on_progress))
 
     daemon = subprocess.Popen(
         [sys.executable, "-m", "ssh_vpn_gui.tunnel_daemon", server, login],
@@ -188,46 +154,33 @@ def cleanup_remote(
         with_tun=False,
     )
     if dry_run:
-        return [" ".join(shlex.quote(part) for part in command)]
+        return [_quoted(command)]
 
     ensure_data_dir()
     return _run_password_ssh(command, password, timeout=timeout, success_message="remote cleanup complete")
 
 
-def start_remote_ovpn(
+def start_remote_cascade(
     server: str,
     login: str,
     password: str,
-    ovpn_b64: str,
+    cascade: Cascade,
     *,
     dry_run: bool = False,
     on_progress: Callable[[str], None] | None = None,
 ) -> list[str]:
-    state = load_tunnel_state()
-    command = _ssh_command(
-        server,
-        login,
-        remote_ovpn_bootstrap_script(ovpn_b64, cidr=state.cidr if state else None),
-        with_tun=False,
-    )
+    """Switch the running tunnel's second hop on the server to `cascade`."""
     if dry_run:
-        return [" ".join(shlex.quote(part) for part in command)]
+        binding = placeholder_tunnel_binding()
+        return [_quoted(_cascade_command(server, login, cascade, binding))]
+    binding = load_tunnel_state()
+    if binding is None:
+        raise SshTunnelError("Connect first: the second hop runs behind an SSH tunnel.")
     ensure_data_dir()
-    messages = _run_password_ssh(
-        command,
-        password,
-        timeout=OVPN_BOOTSTRAP_TIMEOUT,
-        success_message="remote OpenVPN cascade ready",
-        on_progress=on_progress,
-    )
-    ovpn_dev = parse_remote_allocation("\n".join(messages)).get("ovpn_dev")
-    if ovpn_dev:
-        update_tunnel_ovpn(ovpn_dev)
-        messages.append(f"remote OpenVPN device {ovpn_dev}")
-    return messages
+    return _start_cascade(server, login, password, cascade, binding, on_progress)
 
 
-def stop_remote_ovpn(
+def stop_remote_cascade(
     server: str,
     login: str,
     password: str,
@@ -235,16 +188,48 @@ def stop_remote_ovpn(
     dry_run: bool = False,
     timeout: int = 30,
 ) -> list[str]:
-    command = _ssh_command(server, login, remote_ovpn_cleanup_command(), with_tun=False)
+    command = _ssh_command(server, login, remote_cascade_cleanup_command(), with_tun=False)
     if dry_run:
-        return [" ".join(shlex.quote(part) for part in command)]
+        return [_quoted(command)]
     ensure_data_dir()
-    return _run_password_ssh(
+    messages = _run_password_ssh(
         command,
         password,
         timeout=timeout,
-        success_message="remote OpenVPN cascade stopped",
+        success_message="remote second hop stopped",
     )
+    update_tunnel_ovpn("")
+    return messages
+
+
+def _start_cascade(
+    server: str,
+    login: str,
+    password: str,
+    cascade: Cascade,
+    binding: TunnelBinding,
+    on_progress: Callable[[str], None] | None,
+) -> list[str]:
+    messages = _run_password_ssh(
+        _cascade_command(server, login, cascade, binding),
+        password,
+        timeout=CASCADE_BOOTSTRAP_TIMEOUT_SECONDS,
+        success_message=f"remote {cascade.label} second hop ready",
+        on_progress=on_progress,
+    )
+    ovpn_dev = parse_remote_allocation("\n".join(messages)).get("ovpn_dev", "")
+    update_tunnel_ovpn(ovpn_dev)
+    if ovpn_dev:
+        messages.append(f"remote OpenVPN device {ovpn_dev}")
+    return messages
+
+
+def _cascade_command(server: str, login: str, cascade: Cascade, binding: TunnelBinding) -> list[str]:
+    return _ssh_command(server, login, remote_cascade_script(cascade, binding), with_tun=False)
+
+
+def _quoted(command: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in command)
 
 
 def _run_password_ssh(
@@ -263,30 +248,28 @@ def _run_password_ssh(
                 [
                     r"(?i)password:",
                     r"(?i)are you sure you want to continue connecting",
-                    r"SSH_VPN_OVPN_PROGRESS [^\r\n]+",
-                    r"SSH_VPN_OVPN_INSTALLING",
-                    r"SSH_VPN_OVPN_REAP_BEFORE_START",
+                    r"SSH_VPN_PROGRESS [^\r\n]+",
                     pexpect.EOF,
                     pexpect.TIMEOUT,
                 ]
             )
             transcript += child.before or ""
-            _emit_ovpn_progress(child.before or "", on_progress)
+            _emit_progress(child.before or "", on_progress)
             if index == 0:
                 child.sendline(password)
             elif index == 1:
                 child.sendline("yes")
-            elif index <= 4:
+            elif index == 2:
                 transcript += child.after or ""
-                _emit_ovpn_progress(child.after or "", on_progress)
-            elif index == 5:
+                _emit_progress(child.after or "", on_progress)
+            elif index == 3:
                 child.close()
                 if child.exitstatus not in (None, 0):
                     raise SshTunnelError(_clean_ssh_output(transcript) or f"SSH exited with {child.exitstatus}")
                 output = _clean_ssh_output(transcript)
                 messages = [success_message] if success_message else ([output] if output else [])
                 messages.extend(_allocation_lines(output))
-                messages.extend(_ovpn_reap_messages(output))
+                messages.extend(_cascade_messages(output))
                 return messages
             else:
                 raise SshTunnelError(_clean_ssh_output(transcript) or "Timed out during SSH command")
@@ -294,17 +277,13 @@ def _run_password_ssh(
         child.close(force=True)
 
 
-def _emit_ovpn_progress(chunk: str, on_progress: Callable[[str], None] | None) -> None:
+def _emit_progress(chunk: str, on_progress: Callable[[str], None] | None) -> None:
     if on_progress is None:
         return
     for raw in chunk.replace("\r", "").splitlines():
         line = raw.strip()
-        if line.startswith("SSH_VPN_OVPN_PROGRESS "):
+        if line.startswith("SSH_VPN_PROGRESS "):
             on_progress(line.split(" ", 1)[1])
-        elif line == "SSH_VPN_OVPN_INSTALLING":
-            on_progress("Installing OpenVPN packages on the server...")
-        elif line == "SSH_VPN_OVPN_REAP_BEFORE_START":
-            on_progress("Clearing leftover OpenVPN on the server...")
 
 
 def _allocation_lines(output: str) -> list[str]:
@@ -321,9 +300,12 @@ def _allocation_lines(output: str) -> list[str]:
     ]
 
 
-def _ovpn_reap_messages(output: str) -> list[str]:
+def _cascade_messages(output: str) -> list[str]:
     messages: list[str] = []
     for line in output.splitlines():
+        if line.startswith("SSH_VPN_INSTALLING "):
+            messages.append(f"installed {line.split(' ', 1)[1]} on the remote server")
+            continue
         if not line.startswith("SSH_VPN_OVPN_LEFTOVERS"):
             continue
         parts = line.split()
@@ -334,8 +316,6 @@ def _ovpn_reap_messages(output: str) -> list[str]:
         if count:
             noun = "client" if count == 1 else "clients"
             messages.append(f"cleared {count} leftover remote OpenVPN {noun}")
-    if "SSH_VPN_OVPN_INSTALLING" in output:
-        messages.append("installed OpenVPN packages on the remote server")
     return messages
 
 
@@ -343,7 +323,9 @@ def _clean_ssh_output(output: str) -> str:
     lines = [
         line.strip()
         for line in output.replace("\r", "").splitlines()
-        if line.strip() and "bind: warning: line editing not enabled" not in line
+        if line.strip()
+        and "bind: warning: line editing not enabled" not in line
+        and not line.strip().startswith("SSH_VPN_PROGRESS ")
     ]
     return "\n".join(lines)
 

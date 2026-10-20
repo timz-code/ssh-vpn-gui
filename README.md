@@ -4,8 +4,8 @@ SSH VPN GUI turns a Linux VPS you can log in to over SSH into a personal VPN
 for your Ubuntu desktop. It carries traffic through an OpenSSH TUN tunnel
 (`ssh -w`), prepares the server by itself, and uses your rules to decide, per
 domain and per IP address, what goes through the tunnel and what stays on your
-normal connection. An OpenVPN profile running on the server can add a second
-hop behind the tunnel.
+normal connection. The server can pass tunnel traffic on through a second hop:
+your OpenVPN profile, Tor, or a SOCKS5 proxy.
 
 ![SSH VPN GUI main window](assets/screenshot.png)
 
@@ -13,7 +13,8 @@ hop behind the tunnel.
 
 - **Saved servers.** Pick a server from a menu where each entry reads
   `IP Notice`. Add servers with **+** and remove them with **−**. Every server
-  keeps its own login and password.
+  keeps its own login and password. Choosing another server while connected
+  moves the tunnel to it.
 - **No manual server setup.** The first connect enables TUN, IPv4 forwarding,
   `PermitTunnel` and NAT on the VPS over SSH.
 - **Rule-based or full tunnel.** `routing.cfg` sends domains, Geosite lists,
@@ -22,8 +23,10 @@ hop behind the tunnel.
   through the tunnel.
 - **Split DNS over TLS.** A local resolver asks Cloudflare or Quad9 over TLS
   and sends each lookup the same way as the domain it is for.
-- **Cascaded VPN.** Run your own `.ovpn` profile on the VPS so that tunnel
-  traffic leaves through your VPN provider.
+- **Second hop.** Tunnel traffic can leave the VPS through one of your `.ovpn`
+  profiles, through Tor, or through one of your SOCKS5 proxies. Profiles and
+  proxies are kept in lists, like servers, and can have names. The app
+  installs what the server needs.
 - **Kill switch.** If the tunnel dies, direct traffic keeps working and
   everything else is blocked at once, even with the window closed, until the
   tunnel is back or you press **Exit and Restore**.
@@ -39,8 +42,8 @@ hop behind the tunnel.
                      ssh -w (IPv4 over SSH)
 your computer ─────────────────────────────▶ VPS ──▶ Internet
   │                                           │
-  │ direct traffic                            └──▶ OpenVPN provider ──▶ Internet
-  ▼                                                (optional cascade)
+  │ direct traffic                            └──▶ OpenVPN, Tor or SOCKS5 ──▶ Internet
+  ▼                                                (optional second hop)
 your normal connection ──▶ Internet
 ```
 
@@ -100,7 +103,8 @@ app. If a tunnel was up during the upgrade, disconnect and connect again so it
 runs on the new version. Saved servers and `/etc/ssh-vpn-gui/routing.cfg` are
 kept. A
 `config.json` from a single-server version is converted to the server list on
-first launch.
+first launch, and a saved `.ovpn` file becomes the first entry of the profile
+list.
 
 To uninstall, run `sudo apt remove ssh-vpn-gui`. Use
 `sudo apt purge ssh-vpn-gui` to also remove `/etc/ssh-vpn-gui/routing.cfg`.
@@ -117,12 +121,32 @@ To uninstall, run `sudo apt remove ssh-vpn-gui`. Use
    a little longer. The window title changes to **SSH VPN CONNECTED**.
 
 Saving the same IP and login again replaces the stored password. **−**
-deletes the selected server. The server list is locked while connected.
+deletes the selected server. While connected, **+** and **−** are off, and
+choosing another server switches the tunnel to it; see
+[Switching servers](#switching-servers).
 
 Closing the window does not disconnect. The tunnel keeps running, and the
 window picks it up again the next time you open it. Use **Disconnect** to
 stop it. The kill switch keeps working while the window is closed; see
 [When the tunnel drops](#when-the-tunnel-drops).
+
+## Switching servers
+
+Choose another server in the menu while connected, and the app moves the
+tunnel in one step:
+
+1. It closes the tunnel to the current server and cleans that server up,
+   including its second hop. If the server cannot be reached, its cleanup is
+   skipped and the switch goes on.
+2. It connects to the new server with the same **Routing rules** setting and
+   **Second hop**.
+
+While the tunnel moves, traffic meant for it is blocked, so nothing leaks
+onto your normal connection. If the new server does not connect, the window
+shows why, the block stays, and the app tries the new server again once a
+minute until it connects or you press **Exit and Restore**. If you cancel
+the password prompt, nothing changes and the menu goes back to the server
+you are connected to.
 
 ## Routing rules
 
@@ -165,16 +189,64 @@ ip(geoip:hk, geoip:mo)->proxy
 `/var/lib/ssh-vpn-gui/geosite`. Run it from time to time to pick up list
 updates.
 
-## Cascaded VPN with an .ovpn file
+## Second hop: OpenVPN, Tor or SOCKS5
 
-Tick **Use .ovpn file on remote server** and choose an OpenVPN client profile
-to put a VPN provider behind the SSH tunnel:
+**Second hop** chooses where the VPS sends the traffic that arrives through
+the tunnel:
 
 ```text
-your computer -> SSH tunnel -> VPS -> OpenVPN provider -> Internet
+your computer -> SSH tunnel -> VPS -> second hop -> Internet
 ```
 
-On the server, the app then:
+| Second hop | Tunnel traffic leaves from | What gets through |
+| --- | --- | --- |
+| None | The VPS's own address | All IPv4 traffic |
+| OpenVPN (.ovpn file) | Your VPN provider | All IPv4 traffic |
+| Tor | A Tor exit relay | TCP and DNS |
+| SOCKS5 proxy | Your proxy | TCP and DNS |
+
+Only traffic that arrives through the tunnel takes the second hop. The
+server's own traffic and your SSH session keep using its normal route, and
+`direct` traffic stays on your normal connection.
+
+The second hop fails closed on the server. While it starts, and if it stops
+later, tunnel traffic is blocked on the server instead of leaving from the
+VPS's own address. To bring a stopped hop back, choose it again or reconnect.
+
+After the hop starts, the app checks connectivity and shows the new public IP.
+If starting or the check fails, the app stops the hop, and **Second hop**
+returns to **None**.
+
+OpenVPN profiles and SOCKS5 proxies are kept in lists, which work like the
+server list: **+** adds an entry, **−** removes the chosen one, and the hop
+uses the entry chosen in the list. If the list is empty when you choose the
+hop, the app asks for the first entry right away. An entry with a name shows
+the name instead of its file or address; hover over the list to see which
+file or address is chosen.
+
+The choice works while connected:
+
+- Changing **Second hop** starts the new hop without rebuilding the SSH
+  tunnel. **None** stops it.
+- Choosing another profile or proxy in the list, or adding one with **+**,
+  while that hop runs restarts it with the new entry. A new name for the
+  running entry does not restart it. **−** is off while connected.
+- **Routing rules** switches between `routing.cfg` and full-tunnel mode on the
+  fly.
+- While disconnected, changes are saved for the next connect. If stopping a
+  hop fails, **Second hop** keeps the previous choice.
+
+Switching the second hop changes your public IP, so open connections have to
+reconnect. The app clears stale connection-tracking entries on the server so
+browsers open fresh sessions right away.
+
+### OpenVPN
+
+Choose **OpenVPN (.ovpn file)** and pick an OpenVPN client profile in the
+**OpenVPN config** list. **+** adds one: choose the profile file and,
+optionally, a name. Adding the same file again replaces its name. **−** only
+takes a profile off the list and leaves the file alone. On the server, the
+app then:
 
 1. Installs OpenVPN and conntrack if they are missing (apt, dnf or yum). The
    first install can take several minutes, and its progress is shown in the
@@ -184,35 +256,60 @@ On the server, the app then:
    channel offload (DCO) turned off. DCO ignores the requested device name and
    can take over the SSH tunnel's device. The client log goes to
    `/var/log/ssh-vpn-gui-ovpn.log`.
-4. Adds policy routing so that only traffic arriving from the SSH tunnel
-   leaves through OpenVPN. The server's own traffic and your SSH session keep
-   using its normal route.
-
-`proxy` traffic then exits through the VPN provider, while `direct` traffic
-stays on your normal connection. After enabling the cascade, the app checks
-connectivity and shows the new public IP. If the check fails, it stops
-OpenVPN and goes back to SSH only. Disconnect stops the client and removes the
-extra routing.
-
-Both checkboxes work while connected:
-
-- Unticking **Use .ovpn file on remote server** stops the cascade. Ticking it
-  starts the cascade without rebuilding the SSH tunnel.
-- **Routing rules** switches between `routing.cfg` and full-tunnel mode on the
-  fly.
-- Choosing another `.ovpn` file while the cascade runs restarts the client
-  with the new file.
-- While disconnected, checkbox changes are saved for the next connect. If a
-  live change fails, the checkbox returns to its previous state.
-
-Switching the cascade changes your public IP, so open connections have to
-reconnect. The app clears stale connection-tracking entries on the server so
-browsers open fresh sessions right away.
+4. Routes tunnel traffic into the client. The route survives OpenVPN's own
+   reconnects. If the client exits, tunnel traffic is blocked.
 
 The profile must be self-contained, with certificates and keys inline.
 Profiles that ask for a username and password interactively (`auth-user-pass`
 without credentials) do not start. Embed the credentials in the file if your
 provider needs them.
+
+### Tor
+
+Choose **Tor**. On the server, the app then:
+
+1. Installs Tor, nftables and conntrack if they are missing (apt, dnf or yum;
+   on RHEL-based systems Tor comes from EPEL). If the app installed Tor, it
+   turns off the distribution's own Tor service.
+2. Starts its own Tor client, separate from any Tor service already on the
+   server. It uses `/etc/ssh-vpn-gui/torrc`, keeps its data in
+   `/var/lib/ssh-vpn-gui/tor` and logs to `/var/log/ssh-vpn-gui-tor.log`.
+3. Waits until Tor has connected to the Tor network, for up to three minutes,
+   and shows the progress in the window. Later starts reuse the saved data and
+   take seconds.
+4. Sends TCP from the tunnel into Tor's transparent proxy and DNS queries into
+   Tor's DNS resolver.
+
+Tor gives you a different exit address, not Tor Browser's anonymity: cookies,
+logins and your browser's fingerprint still identify you. Many sites block or
+challenge Tor exit addresses.
+
+### SOCKS5 proxy
+
+Choose **SOCKS5 proxy** and pick a proxy in the **SOCKS5 proxy** list. **+**
+adds one: enter an optional name, the proxy's address (an IPv4 address or a
+host name), port, and optional login and password. Adding the same address,
+port and login again replaces the saved name and password. The VPS connects
+to the proxy, so the proxy must be reachable from the server, not just from
+your computer. On the server, the app then:
+
+1. Installs redsocks, curl, nftables and conntrack if they are missing. This
+   works on Debian and Ubuntu servers. On other systems, install `redsocks`
+   yourself.
+2. Checks the proxy from the server and shows its exit IP. If the check
+   fails, nothing starts.
+3. Starts redsocks with `/etc/ssh-vpn-gui/redsocks.conf` (mode `0600`,
+   deleted when the hop stops) and logs to
+   `/var/log/ssh-vpn-gui-redsocks.log`.
+4. Sends TCP from the tunnel through the proxy. DNS queries get a "truncated"
+   reply, so resolvers repeat them over TCP, which goes through the proxy.
+
+With Tor or a SOCKS5 proxy, other UDP traffic, QUIC included, is rejected, so
+browsers fall back to TCP. Ping does not work. With a SOCKS5 proxy, a
+resolver that sends EDNS0 queries through the tunnel, such as
+`systemd-resolved` in full-tunnel mode, gets its first answer only after a
+few seconds of retries. Rule-based mode resolves names over TLS, which is
+TCP, so it is not affected.
 
 ## When the tunnel drops
 
@@ -229,7 +326,7 @@ The app checks the tunnel every four seconds and right after the computer
 wakes up. When it finds the tunnel dead, it:
 
 1. Cleans up the dead session locally and, if the server is reachable, on the
-   server too, including the OpenVPN client.
+   server too, including the second hop.
 2. Changes the title to **SSH VPN — blocked** and shows **Exit and Restore**
    to the right of **Disconnect**.
 3. Reconnects: eight attempts in a row, then once a minute until one
@@ -264,8 +361,15 @@ On connect, as root, the app:
 - Allows forwarding for the tunnel subnet and masquerades it on the outgoing
   interface, using nftables or iptables.
 
-Disconnect stops the OpenVPN client and removes the NAT, forwarding and
-policy-routing rules. The SSH and sysctl settings stay in place.
+A second hop also adds policy routing table `2124` for the tunnel subnet. Tor
+and SOCKS5 add the nftables table `ip ssh_vpn_gui_cascade`, which redirects
+tunnel traffic to `127.0.0.1`, turn on `route_localnet` for the tunnel device,
+and add an iptables `INPUT` rule commented `ssh-vpn-gui-cascade` so that ufw
+or a default-drop firewall lets the redirected connections in.
+
+Disconnect stops the second hop and removes the NAT, forwarding,
+policy-routing and redirect rules. The SSH and sysctl settings stay in place,
+and so do the packages a second hop installed.
 
 ## Local administrator rights
 
@@ -309,6 +413,10 @@ sudo ssh-vpn-helper diagnose --server SERVER_IP
 - **Connection timed out:** check that port 22 on the server is reachable.
 - **Tunnel device open failed:** the VPS provider has TUN turned off.
 - **Routing data missing:** click **Update Routing Data**.
+- **Second hop does not start:** the error ends with the last lines of the
+  hop's log. The full logs are on the server in
+  `/var/log/ssh-vpn-gui-ovpn.log`, `/var/log/ssh-vpn-gui-tor.log` and
+  `/var/log/ssh-vpn-gui-redsocks.log`.
 - **Traffic is blocked and you want your normal connection back without the
   app:** run `sudo ssh-vpn-helper disconnect --local-only`.
 
@@ -377,8 +485,10 @@ PyGObject comes from Ubuntu's `python3-gi` package rather than from PyPI.
 
 - The app changes the server as root, including allowing root login with a
   password over SSH. Use a server dedicated to this purpose.
-- Saved servers, passwords included, are stored unencrypted in
-  `~/.config/ssh-vpn-gui/config.json` with mode `0600`.
+- Saved servers and SOCKS5 proxies, passwords included, are stored
+  unencrypted in `~/.config/ssh-vpn-gui/config.json` with mode `0600`. The
+  `.ovpn` profile and the SOCKS5 password reach the server inside the SSH
+  session and are kept there in files only root can read.
 - A server's host key is accepted on the first connect and stored in
   `/var/lib/ssh-vpn-gui/known_hosts`. A changed key is rejected.
 - The tunnel carries IPv4 only, so outgoing IPv6 is rejected in both modes

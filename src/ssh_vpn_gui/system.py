@@ -26,29 +26,28 @@ IPV6_GUARD_CONFIG = STATE_DIR / "ipv6-guard.nft"
 SINGBOX_PID = STATE_DIR / "sing-box.pid"
 
 OVPN_DEV = "ovpn0"
-OVPN_TABLE = "2124"
-# Looked up before OVPN_TABLE so replies to the SSH tun peer do not
-# follow the cascade default and vanish inside OpenVPN.
-OVPN_KEEP_TUN_PRIORITY = "2123"
+# Traffic from the SSH /30 looks up this table on the server when a second
+# hop (OpenVPN, Tor or a SOCKS5 proxy) is on.
+CASCADE_TABLE = "2124"
+# Looked up before CASCADE_TABLE so replies to the SSH tun peer do not
+# follow the second hop and vanish inside it.
+CASCADE_KEEP_TUN_PRIORITY = "2123"
+CASCADE_NFT_TABLE = "ssh_vpn_gui_cascade"
+CASCADE_INPUT_COMMENT = "ssh-vpn-gui-cascade"
 TUNNEL_STATE = STATE_DIR / "tunnel.env"
 FAIL_CLOSED_FLAG = STATE_DIR / "fail-closed"
 OVPN_CONFIG_PATH = "/etc/ssh-vpn-gui/client.ovpn"
 OVPN_PID_PATH = "/run/ssh-vpn-gui-ovpn.pid"
-OVPN_LOG_PATH = "/var/log/ssh-vpn-gui-ovpn.log"
-OVPN_INTERFACE_WAIT_SECONDS = 90
-OVPN_CONNECT_TIMEOUT_SECONDS = 8
-# First apt/dnf/yum of openvpn+conntrack can sit on a lock or a slow
-# mirror for minutes. This is the laptop wait for that SSH script — not
-# an OpenVPN connect timeout. Cutting SSH first leaves a half-installed
-# package manager and leftover clients.
-OVPN_BOOTSTRAP_TIMEOUT_SECONDS = 600
-OVPN_HELPER_TIMEOUT_SECONDS = 660
-OVPN_APT_LOCK_TIMEOUT_SECONDS = 300
-OVPN_CONNECT_FAIL_PATTERN = (
-    r"AUTH_FAILED|TLS Error|TLS handshake failed|Cannot resolve host address|"
-    r"RESOLVE:|Name or service not known|Connection refused|Options error|"
-    r"Exiting due to fatal error|TCP: connect to .* failed"
-)
+TOR_CONFIG_PATH = "/etc/ssh-vpn-gui/torrc"
+REDSOCKS_CONFIG_PATH = "/etc/ssh-vpn-gui/redsocks.conf"
+SOCKS5_CHECK_CONFIG_PATH = "/etc/ssh-vpn-gui/socks5-check.conf"
+# A first install of the second hop's packages can sit on an apt lock or a
+# slow mirror for minutes. This is the laptop wait for that SSH script, not
+# a connect timeout of the hop. Cutting SSH first leaves a half-installed
+# package manager and leftover daemons.
+CASCADE_BOOTSTRAP_TIMEOUT_SECONDS = 600
+CASCADE_HELPER_TIMEOUT_SECONDS = 660
+APT_LOCK_TIMEOUT_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -606,7 +605,7 @@ def remote_bootstrap_script() -> str:
 set -eu
 changed=0
 
-__SSH_VPN_OVPN_STOP__
+__SSH_VPN_CASCADE_STOP__
 
 if command -v modprobe >/dev/null 2>&1; then
   modprobe tun 2>/dev/null || true
@@ -681,10 +680,10 @@ done
   exit 1
 }
 echo SSH_VPN_BOOTSTRAP_READY
-""".replace("__SSH_VPN_OVPN_STOP__", _remote_ovpn_stop_snippet()).strip()
+""".replace("__SSH_VPN_CASCADE_STOP__", _remote_cascade_stop_snippet()).strip()
 
 
-def _remote_rp_filter_snippet() -> str:
+def remote_rp_filter_snippet() -> str:
     return """
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 # IPv4 forward is AND(all, ingress-iface) on current kernels.
@@ -787,12 +786,17 @@ set -eu
 ip addr flush dev {chosen.remote_tun} || true
 ip addr add {chosen.remote_address} peer {chosen.local_address} dev {chosen.remote_tun} || true
 ip link set {chosen.remote_tun} up
-{_remote_rp_filter_snippet()}
+{remote_rp_filter_snippet()}
 sysctl -w net.ipv4.conf.{chosen.remote_tun}.rp_filter=0 >/dev/null 2>&1 || true
+# A Tor or SOCKS5 second hop, set up before this tun existed, redirects
+# its traffic to 127.0.0.1.
+if nft list table ip {CASCADE_NFT_TABLE} >/dev/null 2>&1; then
+  sysctl -w net.ipv4.conf.{chosen.remote_tun}.route_localnet=1 >/dev/null 2>&1 || true
+fi
 {_remote_nat_snippet(chosen.remote_tun, chosen.cidr)}
 {_remote_forward_accept_snippet(chosen.remote_tun, chosen.cidr)}
-ip rule add from {chosen.cidr} to {chosen.cidr} table main priority {OVPN_KEEP_TUN_PRIORITY} 2>/dev/null || true
-ip route replace {chosen.cidr} dev {chosen.remote_tun} table {OVPN_TABLE} 2>/dev/null || true
+ip rule add from {chosen.cidr} to {chosen.cidr} table main priority {CASCADE_KEEP_TUN_PRIORITY} 2>/dev/null || true
+ip route replace {chosen.cidr} dev {chosen.remote_tun} table {CASCADE_TABLE} 2>/dev/null || true
 echo SSH_VPN_READY
 trap '{_remote_nat_cleanup_snippet(chosen.remote_tun, chosen.cidr)}; {_remote_forward_cleanup_snippet(chosen)}; nft delete table ip ssh_vpn_gui 2>/dev/null || true; ip addr flush dev {chosen.remote_tun} 2>/dev/null || true' EXIT
 while true; do sleep 3600; done
@@ -831,21 +835,19 @@ nft delete table ip ssh_vpn_gui 2>/dev/null || true
 {nat_cleanup}
 {_remote_forward_cleanup_snippet(chosen)}
 {_remote_tun_cleanup_snippet(chosen)}
-{_remote_ovpn_stop_snippet(cidr=chosen.cidr if chosen else None)}
+{_remote_cascade_stop_snippet(cidr=chosen.cidr if chosen else None, tun=chosen.remote_tun if chosen else None)}
 """.strip()
 
 
-def _remote_ovpn_stop_snippet(*, cidr: str | None = None) -> str:
-    tracked = cidr or "10.255.0.0/16"
+def _remote_cascade_stop_snippet(*, cidr: str | None = None, tun: str | None = None) -> str:
+    return f"{_remote_cascade_pid_helpers()}\n{_remote_cascade_stop_commands(cidr=cidr, tun=tun)}"
+
+
+def _remote_cascade_pid_helpers() -> str:
     return f"""
-while ip rule del priority {OVPN_KEEP_TUN_PRIORITY} 2>/dev/null; do :; done
-while ip rule del table {OVPN_TABLE} 2>/dev/null; do :; done
-ip route flush table {OVPN_TABLE} 2>/dev/null || true
-if command -v conntrack >/dev/null 2>&1; then
-  conntrack -D -s {tracked} >/dev/null 2>&1 || true
-fi
-# Ours only: comm is openvpn or the --daemon name. Do not pgrep -f the
-# config path — the SSH bash -lc script text contains it and would die.
+# Ours only: match the process name and our config path in its command
+# line. Do not pgrep -f the path — the SSH bash -lc script text contains
+# it and would die.
 _ssh_vpn_gui_ovpn_pids() {{
   for proc in /proc/[0-9]*; do
     [ -r "$proc/comm" ] && [ -r "$proc/cmdline" ] || continue
@@ -862,6 +864,38 @@ _ssh_vpn_gui_ovpn_pids() {{
     esac
   done | sort -u
 }}
+_ssh_vpn_gui_daemon_pids() {{
+  for proc in /proc/[0-9]*; do
+    read -r comm 2>/dev/null < "$proc/comm" || continue
+    [ "$comm" = "$1" ] || continue
+    cmd=$(tr '\\0' ' ' < "$proc/cmdline" 2>/dev/null || true)
+    case "$cmd" in
+      *"$2"*) printf '%s\\n' "${{proc#/proc/}}" ;;
+    esac
+  done
+}}
+""".strip()
+
+
+def _remote_cascade_stop_commands(*, cidr: str | None = None, tun: str | None = None) -> str:
+    """Stop every second hop on the server, whichever kind is running."""
+    tracked = cidr or "10.255.0.0/16"
+    localnet = f"sysctl -w net.ipv4.conf.{tun}.route_localnet=0 >/dev/null 2>&1 || true\n" if tun else ""
+    return f"""
+while ip rule del priority {CASCADE_KEEP_TUN_PRIORITY} 2>/dev/null; do :; done
+while ip rule del table {CASCADE_TABLE} 2>/dev/null; do :; done
+ip route flush table {CASCADE_TABLE} 2>/dev/null || true
+nft delete table ip {CASCADE_NFT_TABLE} 2>/dev/null || true
+if command -v iptables >/dev/null 2>&1; then
+  iptables -S INPUT 2>/dev/null | sed -n 's/^-A INPUT //p' | while read -r spec; do
+    case "$spec" in
+      *"--comment {CASCADE_INPUT_COMMENT}"*) iptables -D INPUT $spec 2>/dev/null || true ;;
+    esac
+  done
+fi
+{localnet}if command -v conntrack >/dev/null 2>&1; then
+  conntrack -D -s {tracked} >/dev/null 2>&1 || true
+fi
 leftovers=$(_ssh_vpn_gui_ovpn_pids)
 n=0
 if [ -n "$leftovers" ]; then
@@ -895,143 +929,116 @@ for ovpn_dev in $ovpn_ifaces; do
   ip link set "$ovpn_dev" down 2>/dev/null || true
   ip link del "$ovpn_dev" 2>/dev/null || true
 done
+for daemon in tor:{TOR_CONFIG_PATH} redsocks:{REDSOCKS_CONFIG_PATH}; do
+  for _sig in TERM KILL; do
+    for _ in $(seq 1 30); do
+      left=$(_ssh_vpn_gui_daemon_pids "${{daemon%%:*}}" "${{daemon#*:}}")
+      [ -z "$left" ] && break 2
+      for daemon_pid in $left; do
+        kill -"$_sig" "$daemon_pid" 2>/dev/null || true
+      done
+      sleep 0.1
+    done
+  done
+done
+rm -f {REDSOCKS_CONFIG_PATH} {SOCKS5_CHECK_CONFIG_PATH}
 """.strip()
 
 
-def remote_ovpn_cleanup_command(binding: TunnelBinding | None = None) -> str:
+def remote_cascade_cleanup_command(binding: TunnelBinding | None = None) -> str:
     chosen = binding or load_tunnel_state()
     return f"""
 set -eu
-{_remote_ovpn_stop_snippet(cidr=chosen.cidr if chosen else None)}
-echo SSH_VPN_OVPN_STOPPED
+{_remote_cascade_stop_snippet(cidr=chosen.cidr if chosen else None, tun=chosen.remote_tun if chosen else None)}
+echo SSH_VPN_CASCADE_STOPPED
 """.strip()
 
 
-def remote_ovpn_bootstrap_script(ovpn_b64: str, *, cidr: str | None = None) -> str:
-    chosen = cidr
-    if chosen is None:
-        state = load_tunnel_state()
-        chosen = state.cidr if state else ""
+def remote_cascade_prologue(binding: TunnelBinding) -> str:
+    """Header of a second-hop bootstrap script.
+
+    From here on any failure stops every second hop, so the server ends up
+    with none rather than with a half-started one or the previous one.
+    """
     return f"""
-set -eu
-if ! command -v openvpn >/dev/null 2>&1 || ! command -v conntrack >/dev/null 2>&1; then
-  echo SSH_VPN_OVPN_INSTALLING
-  echo 'SSH_VPN_OVPN_PROGRESS Installing OpenVPN packages on the server'
+cidr='{binding.cidr}'
+ssh_tun='{binding.remote_tun}'
+{_remote_cascade_pid_helpers()}
+_ssh_vpn_gui_stop_cascade() {{
+{_remote_cascade_stop_commands(cidr=binding.cidr, tun=binding.remote_tun)}
+}}
+cascade_ready=0
+trap '[ "$cascade_ready" -eq 1 ] || _ssh_vpn_gui_stop_cascade >/dev/null 2>&1' EXIT
+""".strip()
+
+
+def remote_install_snippet(label: str, *, present: str, apt: str, dnf: str | None = None) -> str:
+    if dnf:
+        other_managers = f"""  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y {dnf}
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y {dnf}
+"""
+        unsupported = f"no supported package manager found to install {label}"
+    else:
+        other_managers = ""
+        unsupported = f"{label} can only be installed automatically on Debian or Ubuntu"
+    return f"""
+if ! {{ {present}; }}; then
+  echo 'SSH_VPN_INSTALLING {label}'
+  echo 'SSH_VPN_PROGRESS Installing {label} on the server'
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     export NEEDRESTART_MODE=a
     (
-      apt-get -o DPkg::Lock::Timeout={OVPN_APT_LOCK_TIMEOUT_SECONDS} update
-      apt-get -o DPkg::Lock::Timeout={OVPN_APT_LOCK_TIMEOUT_SECONDS} install -y openvpn conntrack
+      apt-get -o DPkg::Lock::Timeout={APT_LOCK_TIMEOUT_SECONDS} update || true
+      apt-get -o DPkg::Lock::Timeout={APT_LOCK_TIMEOUT_SECONDS} install -y {apt}
     ) &
     _apt_pid=$!
     while kill -0 "$_apt_pid" 2>/dev/null; do
-      echo 'SSH_VPN_OVPN_PROGRESS Installing OpenVPN packages on the server'
+      echo 'SSH_VPN_PROGRESS Installing {label} on the server'
       sleep 8
     done
     wait "$_apt_pid"
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y openvpn conntrack-tools
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y openvpn conntrack-tools
-  else
-    echo 'no supported package manager found to install openvpn and conntrack tools' >&2
+{other_managers}  else
+    echo '{unsupported}' >&2
     exit 1
   fi
 fi
+""".strip()
 
-mkdir -p /etc/ssh-vpn-gui
-base64 -d > {OVPN_CONFIG_PATH} <<'SSH_VPN_OVPN_B64'
-{ovpn_b64}
-SSH_VPN_OVPN_B64
-chmod 600 {OVPN_CONFIG_PATH}
 
-# Reap our leftover clients by config path, then take the first free ovpnN.
-echo 'SSH_VPN_OVPN_REAP_BEFORE_START'
-echo 'SSH_VPN_OVPN_PROGRESS Clearing leftover OpenVPN on the server'
-{_remote_ovpn_stop_snippet(cidr=chosen or None)}
+def remote_cascade_block_snippet() -> str:
+    return f"""
+# While the second hop starts, and after it dies, traffic from the SSH /30
+# that the hop does not carry is unreachable instead of leaving through the
+# server's own address.
+ip route replace unreachable default table {CASCADE_TABLE} metric {KILL_SWITCH_METRIC}
+ip rule add from "$cidr" to "$cidr" table main priority {CASCADE_KEEP_TUN_PRIORITY} 2>/dev/null || true
+ip route replace "$cidr" dev "$ssh_tun" table {CASCADE_TABLE} 2>/dev/null || true
+ip rule add from "$cidr" table {CASCADE_TABLE} priority {CASCADE_TABLE} 2>/dev/null || true
+""".strip()
 
-ovpn_dev=""
-for i in $(seq 0 255); do
-  if [ ! -e /sys/class/net/ovpn$i ]; then
-    ovpn_dev=ovpn$i
-    break
-  fi
-done
-[ -n "$ovpn_dev" ] || {{
-  echo 'no free ovpn device on the remote server' >&2
-  exit 1
+
+def remote_cascade_redirect_snippet(*, tcp_port: int, dns_port: int) -> str:
+    return f"""
+nft -f - <<SSH_VPN_CASCADE_NFT
+table ip {CASCADE_NFT_TABLE} {{
+  chain prerouting {{
+    type nat hook prerouting priority -100; policy accept;
+    iifname "$ssh_tun" ip daddr $cidr return
+    iifname "$ssh_tun" udp dport 53 dnat to 127.0.0.1:{dns_port}
+    iifname "$ssh_tun" ip protocol tcp dnat to 127.0.0.1:{tcp_port}
+  }}
 }}
-echo SSH_VPN_REMOTE_OVPN $ovpn_dev
-
-{_remote_rp_filter_snippet()}
-
-# Timeouts belong to OpenVPN on this server. resolv-retry defaults to
-# infinite and is applied before --daemon returns, so a bad hostname
-# blocks this SSH script for minutes. One short resolve + one connect
-# attempt; the wait loop only watches that process.
-printf '\\n# ssh-vpn-gui timeouts\\nresolv-retry 3\\nconnect-retry-max 1\\nconnect-timeout {OVPN_CONNECT_TIMEOUT_SECONDS}\\nserver-poll-timeout {OVPN_CONNECT_TIMEOUT_SECONDS}\\nignore-unknown-option disable-dco\\ndisable-dco\\n' >> {OVPN_CONFIG_PATH}
-echo 'SSH_VPN_OVPN_PROGRESS Starting OpenVPN cascade'
-# OpenVPN 2.7 DCO ignores --dev ovpnN and opens tun0, clobbering the SSH tun.
-openvpn \
-  --config {OVPN_CONFIG_PATH} \
-  --ignore-unknown-option disable-dco \
-  --disable-dco \
-  --dev-type tun \
-  --dev "$ovpn_dev" \
-  --route-noexec \
-  --resolv-retry 3 \
-  --connect-timeout {OVPN_CONNECT_TIMEOUT_SECONDS} \
-  --server-poll-timeout {OVPN_CONNECT_TIMEOUT_SECONDS} \
-  --connect-retry-max 1 \
-  --daemon ssh-vpn-gui-ovpn \
-  --writepid {OVPN_PID_PATH} \
-  --log {OVPN_LOG_PATH}
-
-up=0
-for _ in $(seq 1 {OVPN_INTERFACE_WAIT_SECONDS}); do
-  if ip -4 addr show "$ovpn_dev" 2>/dev/null | grep -q 'inet '; then
-    up=1
-    break
-  fi
-  if ! {{ [ -f {OVPN_PID_PATH} ] && kill -0 "$(cat {OVPN_PID_PATH})" 2>/dev/null; }}; then
-    echo 'openvpn exited during startup' >&2
-    tail -n 25 {OVPN_LOG_PATH} 2>/dev/null >&2 || true
-    {_remote_ovpn_stop_snippet(cidr=chosen or None)}
-    exit 1
-  fi
-  if [ -f {OVPN_LOG_PATH} ] && grep -Eiq '{OVPN_CONNECT_FAIL_PATTERN}' {OVPN_LOG_PATH}; then
-    echo 'openvpn failed to connect to the VPN server' >&2
-    tail -n 25 {OVPN_LOG_PATH} 2>/dev/null >&2 || true
-    {_remote_ovpn_stop_snippet(cidr=chosen or None)}
-    exit 1
-  fi
-  sleep 1
-done
-
-if [ "$up" -ne 1 ]; then
-  echo 'openvpn interface did not come up in time' >&2
-  tail -n 25 {OVPN_LOG_PATH} 2>/dev/null >&2 || true
-  {_remote_ovpn_stop_snippet(cidr=chosen or None)}
-  exit 1
+SSH_VPN_CASCADE_NFT
+# The kernel drops packets for 127.0.0.1 that arrive on another interface
+# unless route_localnet is on there. Before connect, the tun does not exist
+# yet; the SSH session sets this when it creates it.
+sysctl -w "net.ipv4.conf.$ssh_tun.route_localnet=1" >/dev/null 2>&1 || true
+# ufw and many VPS images DROP INPUT, and redirected connections are local.
+if command -v iptables >/dev/null 2>&1; then
+  iptables -C INPUT -i "$ssh_tun" -m conntrack --ctstate DNAT -m comment --comment {CASCADE_INPUT_COMMENT} -j ACCEPT 2>/dev/null || \\
+    iptables -I INPUT 1 -i "$ssh_tun" -m conntrack --ctstate DNAT -m comment --comment {CASCADE_INPUT_COMMENT} -j ACCEPT 2>/dev/null || true
 fi
-
-cidr='{chosen}'
-if [ -z "$cidr" ]; then
-  cidr=$(ip -4 -o addr show 2>/dev/null | sed -n 's/.* inet 10\\.255\\.\\([0-9][0-9]*\\)\\.[12]\\/.*/10.255.\\1.0\\/30/p' | head -n 1)
-fi
-sysctl -w "net.ipv4.conf.$ovpn_dev.rp_filter=0" >/dev/null 2>&1 || true
-ip route replace default dev "$ovpn_dev" table {OVPN_TABLE}
-if [ -n "$cidr" ]; then
-  # Traffic from the SSH /30 to the internet goes via OpenVPN. Replies
-  # to the laptop peer must stay on the SSH tun — otherwise the local
-  # daemon's ping misses and it tears the session down.
-  ip rule add from "$cidr" to "$cidr" table main priority {OVPN_KEEP_TUN_PRIORITY} 2>/dev/null || true
-  ssh_tun=$(ip -4 -o addr show 2>/dev/null | awk '/inet 10\\.255\\.[0-9]+\\.2\\// {{print $2; exit}}')
-  if [ -n "$ssh_tun" ]; then
-    ip route replace "$cidr" dev "$ssh_tun" table {OVPN_TABLE} 2>/dev/null || true
-  fi
-  ip rule add from "$cidr" table {OVPN_TABLE} priority {OVPN_TABLE} 2>/dev/null || true
-fi
-echo SSH_VPN_OVPN_READY
 """.strip()

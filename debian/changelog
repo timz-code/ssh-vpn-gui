@@ -1,3 +1,40 @@
+ssh-vpn-gui (0.2.38) unstable; urgency=medium
+
+  * Replace the "Use .ovpn file on remote server" checkbox with a
+    "Second hop" choice: None, OpenVPN (.ovpn file), Tor or a SOCKS5
+    proxy (address, port, optional login and password). The choice can
+    be changed while connected; the old checkbox setting is carried over.
+  * Keep OpenVPN profiles and SOCKS5 proxies in lists with + and -, like
+    servers. An entry can have a name, which the list shows instead of
+    the file or address. Choosing or adding an entry while its hop runs
+    restarts the hop with it; a new name alone does not. The .ovpn file
+    saved by earlier versions becomes the first profile in the list.
+  * Choosing another server while connected moves the tunnel to it in a
+    single helper run: the old tunnel is closed and its server cleaned
+    up, second hop included, while non-direct traffic stays blocked
+    until the new tunnel is up. If the new server fails, the block stays
+    and the connect is retried once a minute; a cancelled password
+    prompt keeps the current connection.
+  * Tor: install Tor on the server and run a separate instance whose
+    transparent proxy and DNS port receive the tunnel's TCP and DNS.
+    Connection progress to the Tor network is shown in the window.
+  * SOCKS5: check the proxy from the server, then run redsocks so the
+    tunnel's TCP goes through the proxy; DNS is answered "truncated" so
+    resolvers retry over TCP through the proxy. Automatic install on
+    Debian and Ubuntu servers.
+  * The second hop fails closed on the server: while it starts and after
+    it stops, tunnel traffic is unreachable instead of leaving from the
+    server's own address. OpenVPN now keeps its device across its own
+    reconnects (--persist-tun).
+  * A second hop that fails to start, or fails the public IP check, is
+    removed from the server completely and the choice returns to None.
+  * The SOCKS5 password goes to the helper on stdin, never on the command
+    line. The public IP check only accepts a real IP address.
+  * A failed connect while traffic is blocked shows its error instead of
+    "Tunnel died after 0 reconnect attempts".
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Tue, 20 Oct 2026 11:27:44 +0300
+
 ssh-vpn-gui (0.2.37) unstable; urgency=medium
 
   * Load IPv4 GeoIP country networks into permanent nftables sets when

@@ -3,7 +3,7 @@ import subprocess
 
 import pytest
 
-from ssh_vpn_gui import system
+from ssh_vpn_gui import cascade, system
 
 
 @dataclass
@@ -85,7 +85,16 @@ def test_bootstrap_allocates_remote_tun_instead_of_hardcoding_tun3() -> None:
 
 
 def test_ovpn_bootstrap_picks_free_ovpn_device() -> None:
-    script = system.remote_ovpn_bootstrap_script("Zm9v")
+    script = cascade.remote_ovpn_bootstrap_script(
+        "Zm9v",
+        system.TunnelBinding(
+            local_tun="tun4",
+            remote_tun="tun7",
+            local_address="10.255.8.1",
+            remote_address="10.255.8.2",
+            cidr="10.255.8.0/30",
+        ),
+    )
 
     assert "SSH_VPN_REMOTE_OVPN" in script
     assert "ovpn$i" in script
@@ -100,11 +109,42 @@ def test_ovpn_bootstrap_picks_free_ovpn_device() -> None:
     assert "-j SNAT --to-source" not in script
 
 
-def test_ovpn_stop_removes_keep_tun_rule() -> None:
-    script = system.remote_ovpn_cleanup_command()
+def test_cascade_stop_removes_keep_tun_rule_and_every_hop() -> None:
+    script = system.remote_cascade_cleanup_command(
+        system.TunnelBinding(
+            local_tun="tun4",
+            remote_tun="tun7",
+            local_address="10.255.8.1",
+            remote_address="10.255.8.2",
+            cidr="10.255.8.0/30",
+        )
+    )
 
     assert "ip rule del priority 2123" in script
     assert "ip rule del table 2124" in script
+    assert "nft delete table ip ssh_vpn_gui_cascade" in script
+    assert "--comment ssh-vpn-gui-cascade" in script
+    assert "net.ipv4.conf.tun7.route_localnet=0" in script
+    assert "conntrack -D -s 10.255.8.0/30" in script
+    assert "tor:/etc/ssh-vpn-gui/torrc" in script
+    assert "redsocks:/etc/ssh-vpn-gui/redsocks.conf" in script
+    assert "rm -f /etc/ssh-vpn-gui/redsocks.conf" in script
+    assert script.rstrip().endswith("echo SSH_VPN_CASCADE_STOPPED")
+
+
+def test_session_script_lets_redirected_traffic_reach_localhost() -> None:
+    script = system.remote_setup_script(
+        system.TunnelBinding(
+            local_tun="tun4",
+            remote_tun="tun7",
+            local_address="10.255.8.1",
+            remote_address="10.255.8.2",
+            cidr="10.255.8.0/30",
+        )
+    )
+
+    assert "nft list table ip ssh_vpn_gui_cascade" in script
+    assert "net.ipv4.conf.tun7.route_localnet=1" in script
 
 
 def test_remote_setup_keeps_ssh_peer_off_the_ovpn_table() -> None:

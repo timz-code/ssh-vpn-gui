@@ -3,6 +3,8 @@ import json
 import re
 import subprocess
 
+import pytest
+
 from ssh_vpn_gui import helper
 
 
@@ -73,8 +75,7 @@ def test_cascade_on_dry_run_uploads_selected_config(tmp_path, capsys) -> None:
     assert result == 0
     assert payload["ok"] is True
     assert "--config /etc/ssh-vpn-gui/client.ovpn" in payload["messages"][0]
-    assert "SSH_VPN_OVPN_REAP_BEFORE_START" in payload["messages"][0]
-    assert payload["messages"][0].index("SSH_VPN_OVPN_REAP_BEFORE_START") < payload[
+    assert payload["messages"][0].index("SSH_VPN_PROGRESS Clearing the previous second hop") < payload[
         "messages"
     ][0].index("--daemon ssh-vpn-gui-ovpn")
     assert "seq 1 90" in payload["messages"][0]
@@ -98,13 +99,13 @@ def test_cascade_on_rolls_back_when_connectivity_check_fails(
     public_ips = iter([None, "198.51.100.10"])
 
     monkeypatch.setattr(helper, "require_root", lambda: None)
-    monkeypatch.setattr(helper, "start_remote_ovpn", lambda *_args, **_kwargs: ["cascade ready"])
+    monkeypatch.setattr(helper, "start_remote_cascade", lambda *_args, **_kwargs: ["cascade ready"])
     monkeypatch.setattr(
         helper,
-        "stop_remote_ovpn",
+        "stop_remote_cascade",
         lambda *_args, **_kwargs: stopped.append(True) or ["cascade stopped"],
     )
-    monkeypatch.setattr(helper, "_curl_public_ip", lambda: next(public_ips))
+    monkeypatch.setattr(helper, "_curl_public_ip", lambda **_kwargs: next(public_ips))
 
     result = helper.main(
         [
@@ -124,8 +125,125 @@ def test_cascade_on_rolls_back_when_connectivity_check_fails(
     assert result == 1
     assert payload["ok"] is False
     assert stopped == [True]
-    assert "was stopped" in payload["error"]
+    assert "OpenVPN second hop failed its connectivity check and was stopped" in payload["error"]
     assert "198.51.100.10" in payload["error"]
+
+
+def test_tor_second_hop_gets_a_longer_ip_check(monkeypatch, tmp_path, capsys) -> None:
+    routing_file = tmp_path / "routing.cfg"
+    routing_file.write_text("default: proxy\n", encoding="utf-8")
+    started = []
+    checks = []
+    monkeypatch.setattr(helper, "require_root", lambda: None)
+    monkeypatch.setattr(
+        helper,
+        "start_remote_cascade",
+        lambda _server, _login, _password, cascade, **_kwargs: started.append(cascade) or ["tor ready"],
+    )
+    monkeypatch.setattr(
+        helper, "_curl_public_ip", lambda **kwargs: checks.append(kwargs["max_time"]) or "198.51.100.77"
+    )
+
+    result = helper.main(
+        [
+            "cascade-on",
+            "--server",
+            "203.0.113.10",
+            "--password",
+            "secret",
+            "--cascade",
+            "tor",
+            "--routing-file",
+            str(routing_file),
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0, payload
+    assert started[0].kind == "tor"
+    assert checks == [helper.TOR_PUBLIC_IP_TIMEOUT_SECONDS]
+    assert payload["messages"][-1] == "public IP: 198.51.100.77"
+
+
+def test_secrets_stdin_keeps_socks5_password_off_the_command_line(monkeypatch, tmp_path, capsys) -> None:
+    from ssh_vpn_gui.cascade import Socks5Proxy
+
+    routing_file = tmp_path / "routing.cfg"
+    routing_file.write_text("default: proxy\n", encoding="utf-8")
+    started = []
+    monkeypatch.setattr(
+        helper,
+        "start_remote_cascade",
+        lambda _server, _login, password, cascade, **_kwargs: started.append((password, cascade)) or ["ok"],
+    )
+    monkeypatch.setattr(
+        helper.sys,
+        "stdin",
+        io.StringIO(json.dumps({"password": "ssh secret", "socks5_password": 'p"w\\d'})),
+    )
+
+    result = helper.main(
+        [
+            "cascade-on",
+            "--server",
+            "203.0.113.10",
+            "--secrets-stdin",
+            "--cascade",
+            "socks5",
+            "--socks5-server=proxy.example.com:1080",
+            "--socks5-user=-alice",
+            "--routing-file",
+            str(routing_file),
+            "--dry-run",
+        ]
+    )
+
+    assert result == 0, capsys.readouterr().out
+    password, cascade = started[0]
+    assert password == "ssh secret"
+    assert cascade.socks5 == Socks5Proxy(host="proxy.example.com", port=1080, user="-alice", password='p"w\\d')
+
+
+def test_connect_rejects_bad_socks5_settings_before_touching_anything(monkeypatch, tmp_path, capsys) -> None:
+    routing_file = tmp_path / "routing.cfg"
+    routing_file.write_text("default: proxy\n", encoding="utf-8")
+    monkeypatch.setattr(helper, "_connect", lambda *_args, **_kwargs: pytest.fail("connect must not start"))
+
+    result = helper.main(
+        [
+            "connect",
+            "--server",
+            "203.0.113.10",
+            "--password",
+            "secret",
+            "--cascade",
+            "socks5",
+            "--socks5-server",
+            "proxy.example.com:70000",
+            "--routing-file",
+            str(routing_file),
+            "--dry-run",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert payload["error"] == "The SOCKS5 port must be between 1 and 65535."
+
+
+def test_public_ip_check_skips_answers_that_are_not_addresses(monkeypatch) -> None:
+    answers = iter(["<html>blocked by proxy</html>\n", "198.51.100.10\n"])
+    seen = []
+
+    def fake_run(command, **kwargs):
+        seen.append((command, kwargs["timeout"]))
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout=next(answers), stderr="")
+
+    monkeypatch.setattr(helper.subprocess, "run", fake_run)
+
+    assert helper._curl_public_ip(max_time=20) == "198.51.100.10"
+    assert seen[0][0][:5] == ["curl", "-4", "-sS", "--max-time", "20"]
+    assert seen[0][1] == 22
 
 
 def test_save_routing_validates_and_atomically_replaces_file(
@@ -382,6 +500,106 @@ def test_full_tunnel_reconnect_while_blocked_routes_before_dropping_rule_mode(
     )
     assert commands.index("nft delete table inet ssh_vpn_gui") > full_tunnel_ready
     assert commands.index("ip route flush table 2023") > full_tunnel_ready
+
+
+def _switch_servers(monkeypatch, tmp_path, secrets, extra_args=()):
+    from dataclasses import dataclass
+
+    routing_file = tmp_path / "routing.cfg"
+    routing_file.write_text("default: proxy\n", encoding="utf-8")
+    runners = []
+    events = []
+
+    @dataclass
+    class CapturingRunner(helper.CommandRunner):
+        def __post_init__(self):
+            runners.append(self)
+
+    def all_commands():
+        return [command for runner in runners for command in runner.commands]
+
+    def fake_cleanup_remote(server, login, password, **_kwargs):
+        events.append(("cleanup_remote", server, login, password, all_commands()))
+        return ["remote cleanup complete"]
+
+    def fake_start_tunnel(server, login, password, **_kwargs):
+        events.append(("start_tunnel", server, login, password, all_commands()))
+        return ["ssh started"]
+
+    monkeypatch.setattr(helper, "CommandRunner", CapturingRunner)
+    monkeypatch.setattr(helper, "is_fail_closed", lambda: False)
+    monkeypatch.setattr(helper, "stop_tunnel", lambda **_kwargs: events.append(("stop_tunnel",)) or [])
+    monkeypatch.setattr(helper, "cleanup_remote", fake_cleanup_remote)
+    monkeypatch.setattr(helper, "start_tunnel", fake_start_tunnel)
+    monkeypatch.setattr(helper, "stop_dns_proxy", lambda **_kwargs: [])
+    monkeypatch.setattr("ssh_vpn_gui.system.load_tunnel_state", lambda: None)
+    monkeypatch.setattr("ssh_vpn_gui.system._tuns_holding_app_p2p", lambda: [])
+    monkeypatch.setattr(helper.sys, "stdin", io.StringIO(json.dumps(secrets)))
+
+    result = helper.main(
+        [
+            "connect",
+            "--server",
+            "192.168.50.3",
+            "--previous-server",
+            "192.168.50.2",
+            "--previous-login",
+            "admin",
+            "--secrets-stdin",
+            "--routing-file",
+            str(routing_file),
+            "--dry-run",
+            *extra_args,
+        ]
+    )
+    return result, events
+
+
+def test_switching_servers_closes_the_old_tunnel_with_traffic_blocked(monkeypatch, tmp_path, capsys) -> None:
+    result, events = _switch_servers(
+        monkeypatch, tmp_path, {"password": "new secret", "previous_password": "old secret"}
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0, captured.out
+    names = [event[0] for event in events]
+    assert names.index("stop_tunnel") < names.index("cleanup_remote") < names.index("start_tunnel")
+    cleanup = events[names.index("cleanup_remote")]
+    assert cleanup[1:4] == ("192.168.50.2", "admin", "old secret")
+    # The old server is cleaned up behind the block, before its pin goes.
+    assert "ip route replace blackhole default table 2023 metric 4095" in cleanup[4]
+    assert "ip route del 192.168.50.2/32" not in cleanup[4]
+    start = events[names.index("start_tunnel")]
+    assert start[1:4] == ("192.168.50.3", "root", "new secret")
+    assert "ip route del 192.168.50.2/32" in start[4]
+    assert "nft add element inet ssh_vpn_gui direct4 { 192.168.50.3 }" in start[4]
+    # Rule mode stays armed until the new tunnel replaces it.
+    assert "nft delete table inet ssh_vpn_gui" not in start[4]
+    assert "ip route flush table 2023" not in start[4]
+    assert "SSH_VPN_GUI_PROGRESS Closing the tunnel to 192.168.50.2..." in captured.err
+    assert "SSH_VPN_GUI_PROGRESS Connecting to 192.168.50.3..." in captured.err
+
+
+def test_switching_servers_without_the_old_password_still_switches(monkeypatch, tmp_path, capsys) -> None:
+    result, events = _switch_servers(monkeypatch, tmp_path, {"password": "new secret"}, ["--no-routing"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 0, payload
+    names = [event[0] for event in events]
+    assert "cleanup_remote" not in names
+    assert "start_tunnel" in names
+    assert "remote cleanup on 192.168.50.2 skipped: no password" in payload["messages"]
+    assert "ip route replace blackhole 0.0.0.0/1 metric 4095" in events[names.index("start_tunnel")][4]
+
+
+def test_previous_server_is_only_for_connect(tmp_path, capsys) -> None:
+    result = helper.main(
+        ["disconnect", "--previous-server", "192.168.50.2", "--routing-file", str(tmp_path / "x"), "--dry-run"]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert payload["error"] == "--previous-server only works with connect"
 
 
 def test_routing_off_installs_full_tunnel_before_dropping_rule_mode(
