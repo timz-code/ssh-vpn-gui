@@ -355,3 +355,19 @@ def test_wall_clock_gap_detects_sleep() -> None:
     assert app.wall_clock_implies_sleep(5) is False
     assert app.wall_clock_implies_sleep(24) is False
     assert app.wall_clock_implies_sleep(26) is True
+
+
+def test_connected_button_shows_how_long_the_tunnel_has_been_up() -> None:
+    assert app.connected_button_label(0) == "Connected 0:00:00"
+    assert app.connected_button_label(7.9) == "Connected 0:00:07"
+    assert app.connected_button_label(65) == "Connected 0:01:05"
+    assert app.connected_button_label(3600 + 125) == "Connected 1:02:05"
+    assert app.connected_button_label(2 * 86400 + 3 * 3600 + 4 * 60 + 5) == "Connected 2d 3:04:05"
+    assert app.connected_button_label(-4) == "Connected 0:00:00"
+
+
+def test_connection_started_at_keeps_a_real_start_and_ignores_a_bad_one() -> None:
+    assert app.connection_started_at(940, now=1000) == 940
+    assert app.connection_started_at(None, now=1000) == 1000
+    assert app.connection_started_at(0, now=1000) == 1000
+    assert app.connection_started_at(1005, now=1000) == 1000

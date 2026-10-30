@@ -121,6 +121,20 @@ def is_tunnel_daemon_alive() -> bool:
     return _pid_runs_module(pid, "ssh_vpn_gui.tunnel_daemon")
 
 
+def tunnel_daemon_started_at() -> float | None:
+    """Wall-clock time the running tunnel daemon was recorded, or None.
+
+    The pid file is written once, when the daemon is ready, so its mtime is
+    when this tunnel came up. A GUI opened later can keep counting from there.
+    """
+    if not is_tunnel_daemon_alive():
+        return None
+    try:
+        return SSH_PID.stat().st_mtime
+    except OSError:
+        return None
+
+
 def stop_tunnel(*, dry_run: bool = False) -> list[str]:
     messages: list[str] = []
     if SSH_PID.exists():

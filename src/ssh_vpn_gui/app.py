@@ -14,10 +14,11 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gio, GLib, Gtk, Pango  # noqa: E402
 
 from .cascade import CASCADE_KINDS, CASCADE_LABELS, socks5_proxy
 from .paths import SUDOERS_RULE, SYSTEM_HELPER, SYSTEM_ROUTING_FILE
+from .ssh_tunnel import tunnel_daemon_started_at
 from .system import CASCADE_HELPER_TIMEOUT_SECONDS, is_fail_closed, load_tunnel_state
 from .tunnel_watch import TunnelSnapshot, evaluate_tunnel_health, inspect_tunnel
 
@@ -43,6 +44,29 @@ CASCADE_HINTS = {
     "socks5": "TCP and DNS go through the proxy. Other UDP and ping are blocked.",
 }
 SOCKS5_FIELDS = ("name", "host", "port", "user", "password")
+
+
+def connected_button_label(elapsed_seconds: float) -> str:
+    """`Connected 1:02:05`, or `Connected 2d 3:04:05` after a day."""
+    total = max(0, int(elapsed_seconds))
+    days, rest = divmod(total, 24 * 60 * 60)
+    hours, rest = divmod(rest, 60 * 60)
+    minutes, seconds = divmod(rest, 60)
+    clock = f"{hours}:{minutes:02d}:{seconds:02d}"
+    if days:
+        return f"Connected {days}d {clock}"
+    return f"Connected {clock}"
+
+
+def connection_started_at(recorded: float | None, *, now: float) -> float:
+    """Uptime origin for a tunnel found already running.
+
+    `recorded` is the daemon pid file's mtime. A missing, zero or future
+    value means the real start is unknown, so counting begins at `now`.
+    """
+    if recorded is None or recorded <= 0 or recorded > now:
+        return now
+    return recorded
 
 
 def next_reconnect_delay_ms(attempts: int) -> int | None:
@@ -421,6 +445,9 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self._peer_watch_usable = False
         self._sleep_subscription = 0
         self._login1_connection: Gio.DBusConnection | None = None
+        # Wall-clock moment the current tunnel came up. None while disconnected.
+        self._connected_since: float | None = None
+        self._uptime_source: int | None = None
 
         saved_config = load_saved_config()
         self.servers: list[dict[str, str]] = saved_config["servers"]
@@ -483,6 +510,13 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self.connect_button = Gtk.Button(label="Connect")
         self.connect_button.add_css_class("suggested-action")
         self.connect_button.connect("clicked", self._on_connect_clicked)
+        # The uptime on this button ticks every second. Tabular figures keep
+        # "1" and "0" the same width, so the button does not jump sideways.
+        connect_label = self.connect_button.get_child()
+        if isinstance(connect_label, Gtk.Label):
+            figures = Pango.AttrList()
+            figures.insert(Pango.attr_font_features_new("tnum"))
+            connect_label.set_attributes(figures)
 
         self.disconnect_button = Gtk.Button(label="Disconnect")
         self.disconnect_button.connect("clicked", self._on_disconnect_clicked)
@@ -689,6 +723,8 @@ class SshVpnWindow(Adw.ApplicationWindow):
         if self._fail_closed and not self._exiting:
             self._on_exit_restore_clicked(None)
             return True
+        if not self._exiting:
+            self._stop_uptime_timer()
         return bool(self._exiting)
 
     def _on_update_geo_clicked(self, _button: Gtk.Button) -> None:
@@ -1119,6 +1155,10 @@ class SshVpnWindow(Adw.ApplicationWindow):
         elif result.get("ok"):
             if command == "connect":
                 self.connected = True
+                # Count from this moment, not from the daemon's pid file: the
+                # button only appears once the helper finishes, and a second
+                # hop can take minutes after the tunnel itself is up.
+                self._connected_since = time.time()
                 self._active_server, self._connecting_server = self._connecting_server, None
                 self._fail_closed = False
                 self._auto_reconnects = 0
@@ -1231,6 +1271,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
             return False
         if snapshot.process_up:
             self.connected = True
+            self._connected_since = connection_started_at(tunnel_daemon_started_at(), now=time.time())
             self._adopt_tunnel_server()
             self._peer_watch_usable = snapshot.peer_reachable
             self._start_watch()
@@ -1456,11 +1497,16 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self.connect_button.set_sensitive(available and not self.connected)
         self.disconnect_button.set_sensitive(available and self.connected)
         if self.connected:
+            if self._connected_since is None:
+                self._connected_since = time.time()
             self.set_title("SSH VPN CONNECTED")
-            self.connect_button.set_label("Connected")
+            self.connect_button.set_label(connected_button_label(time.time() - self._connected_since))
+            self._start_uptime_timer()
             self.connect_button.remove_css_class("suggested-action")
             self.disconnect_button.add_css_class("destructive-action")
         else:
+            self._connected_since = None
+            self._stop_uptime_timer()
             self.set_title("SSH VPN")
             self.connect_button.set_label("Connect")
             self.connect_button.add_css_class("suggested-action")
@@ -1472,6 +1518,23 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self.cascade_dropdown.set_sensitive(available)
         self._update_list_controls()
         self._update_exit_restore_button()
+
+    def _start_uptime_timer(self) -> None:
+        if self._uptime_source is None:
+            self._uptime_source = GLib.timeout_add_seconds(1, self._on_uptime_tick)
+
+    def _stop_uptime_timer(self) -> None:
+        source = self._uptime_source
+        self._uptime_source = None
+        if source is not None:
+            GLib.source_remove(source)
+
+    def _on_uptime_tick(self) -> bool:
+        if not self.connected or self._connected_since is None:
+            self._uptime_source = None
+            return False
+        self.connect_button.set_label(connected_button_label(time.time() - self._connected_since))
+        return True
 
     def _update_list_controls(self) -> None:
         available = not self.busy

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssh-vpn-gui"
-version = "0.2.39"
+version = "0.2.40"
 description = "Ubuntu GTK GUI for SSH -w TUN VPN routing with local DNS and nftables"
 readme = "README.md"
 license = { file = "LICENSE" }

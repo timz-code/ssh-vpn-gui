@@ -1,3 +1,4 @@
+import os
 import re
 import shlex
 
@@ -308,3 +309,27 @@ def test_stop_remote_cascade_only_removes_second_hop_state(monkeypatch) -> None:
     assert "ip addr flush dev tun3" not in commands[0]
     assert "route_localnet" not in commands[0]
     assert not re.search(r"-w \d+:\d+", commands[0])
+
+
+def test_tunnel_daemon_started_at_is_the_pid_file_mtime(monkeypatch, tmp_path) -> None:
+    pid_file = tmp_path / "ssh.pid"
+    pid_file.write_text("4242\n", encoding="utf-8")
+    when = 1_700_000_000
+    os.utime(pid_file, (when, when))
+    monkeypatch.setattr(ssh_tunnel, "SSH_PID", pid_file)
+    monkeypatch.setattr(
+        ssh_tunnel, "_pid_runs_module", lambda pid, module: pid == 4242 and "tunnel_daemon" in module
+    )
+
+    assert ssh_tunnel.tunnel_daemon_started_at() == when
+
+
+def test_tunnel_daemon_started_at_is_none_without_a_live_daemon(monkeypatch, tmp_path) -> None:
+    pid_file = tmp_path / "ssh.pid"
+    pid_file.write_text("4242\n", encoding="utf-8")
+    monkeypatch.setattr(ssh_tunnel, "SSH_PID", pid_file)
+    monkeypatch.setattr(ssh_tunnel, "_pid_runs_module", lambda *_args: False)
+
+    assert ssh_tunnel.tunnel_daemon_started_at() is None
+    pid_file.unlink()
+    assert ssh_tunnel.tunnel_daemon_started_at() is None
