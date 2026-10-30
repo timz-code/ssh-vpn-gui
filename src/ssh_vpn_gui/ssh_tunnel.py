@@ -30,6 +30,7 @@ from .system import (
     save_tunnel_state,
     update_tunnel_ovpn,
 )
+from .obfs import parse_obfs_line, port_reachable, proxy_command
 
 SSH_PID = STATE_DIR / "ssh.pid"
 
@@ -73,6 +74,18 @@ def start_tunnel(
         raise SshTunnelError(str(exc)) from exc
     binding = replace(binding, server=server)
     save_tunnel_state(binding)
+    obfs = parse_obfs_line(messages)
+    if obfs is None:
+        raise SshTunnelError("server did not start the TLS forwarder")
+    obfs_port, obfs_pin = obfs
+    _save_obfs(obfs_port, obfs_pin)
+    if not port_reachable(server, obfs_port):
+        raise SshTunnelError(
+            f"TLS port {obfs_port} on the server is not reachable. "
+            "Open that port in the VPS provider firewall. "
+            "The tunnel is sent as TLS data transfer, not as SSH."
+        )
+    messages.append(f"hiding the tunnel as TLS data transfer on port {obfs_port}")
     messages.append(
         f"using {binding.local_tun} <-> {binding.remote_tun} "
         f"({binding.local_address} <-> {binding.remote_address})"
@@ -242,6 +255,16 @@ def _cascade_command(server: str, login: str, cascade: Cascade, binding: TunnelB
     return _ssh_command(server, login, remote_cascade_script(cascade, binding), with_tun=False)
 
 
+def _save_obfs(port: int, fingerprint: str) -> None:
+    path = STATE_DIR / "obfs.env"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"port={port}\nfingerprint={fingerprint}\n", encoding="utf-8")
+    try:
+        path.chmod(0o644)
+    except OSError:
+        pass
+
+
 def _quoted(command: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
@@ -351,6 +374,7 @@ def _ssh_command(
     *,
     with_tun: bool = True,
     binding: TunnelBinding | None = None,
+    obfs: tuple[int, str] | None = None,
 ) -> list[str]:
     command = [
         "ssh",
@@ -375,6 +399,9 @@ def _ssh_command(
                 f"{chosen.local_index}:{chosen.remote_index}",
             ]
         )
+        cover = obfs
+        if cover is not None:
+            command.extend(["-o", "ProxyCommand=" + proxy_command(server, cover[0], cover[1])])
     # OpenSSH joins all arguments after the host into one remote shell command;
     # argument boundaries are not preserved. Quote the complete script so
     # bash receives it as the single argument belonging to -c.

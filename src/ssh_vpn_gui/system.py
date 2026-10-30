@@ -683,8 +683,17 @@ done
   echo 'no free 10.255.N.0/30 pair on the remote server' >&2
   exit 1
 }
+__SSH_VPN_OBFS__
 echo SSH_VPN_BOOTSTRAP_READY
-""".replace("__SSH_VPN_CASCADE_STOP__", _remote_cascade_stop_snippet()).strip()
+""".replace("__SSH_VPN_CASCADE_STOP__", _remote_cascade_stop_snippet()).replace(
+        "__SSH_VPN_OBFS__", _remote_obfs_snippet()
+    ).strip()
+
+
+def _remote_obfs_snippet() -> str:
+    from .obfs import remote_installer_script
+
+    return remote_installer_script()
 
 
 def remote_rp_filter_snippet() -> str:

@@ -8,6 +8,7 @@ import time
 import pexpect
 
 from .ssh_tunnel import _ssh_command
+from .obfs import load_obfs
 from .system import load_tunnel_state, mark_fail_closed, remote_setup_script
 from .tunnel_watch import is_tun_peer_reachable, should_drop_unresponsive_peer
 
@@ -37,7 +38,9 @@ def main(argv: list[str] | None = None) -> int:
         print("missing tunnel binding in /run/ssh-vpn-gui/tunnel.env", file=sys.stderr)
         return 2
 
-    command = _ssh_command(server, login, remote_setup_script(binding), binding=binding)
+    command = _ssh_command(
+        server, login, remote_setup_script(binding), binding=binding, obfs=load_obfs()
+    )
     child = pexpect.spawn(
         command[0],
         command[1:],

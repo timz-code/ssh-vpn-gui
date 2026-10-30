@@ -20,6 +20,7 @@ BOOTSTRAP_MESSAGES = [
     "remote bootstrap complete",
     "SSH_VPN_REMOTE_TUN tun5",
     "SSH_VPN_ADDR 10.255.8.1 10.255.8.2 10.255.8.0/30",
+    "SSH_VPN_OBFS 443 " + "ab" * 32,
 ]
 OVPN_MESSAGES = [
     "remote OpenVPN second hop ready",
@@ -61,6 +62,7 @@ def test_start_tunnel_timeout_terminates_daemon_before_collecting_stderr(monkeyp
     monkeypatch.setattr(ssh_tunnel, "STATE_DIR", tmp_path)
     monkeypatch.setattr(ssh_tunnel, "ensure_data_dir", lambda: None)
     monkeypatch.setattr(ssh_tunnel, "stop_tunnel", lambda dry_run=False: [])
+    monkeypatch.setattr(ssh_tunnel, "port_reachable", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         ssh_tunnel,
         "_run_password_ssh",
@@ -87,6 +89,7 @@ def test_start_tunnel_records_server_as_underlay(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(ssh_tunnel, "SSH_PID", tmp_path / "ssh.pid")
     monkeypatch.setattr(ssh_tunnel, "ensure_data_dir", lambda: None)
     monkeypatch.setattr(ssh_tunnel, "stop_tunnel", lambda dry_run=False: [])
+    monkeypatch.setattr(ssh_tunnel, "port_reachable", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         ssh_tunnel,
         "_run_password_ssh",
@@ -111,6 +114,8 @@ def test_start_tunnel_dry_run_bootstraps_before_tun() -> None:
     assert not re.search(r"-w \d+:\d+", commands[0])
     assert "PermitTunnel point-to-point" in commands[0]
     assert "SSH_VPN_REMOTE_TUN" in commands[0]
+    assert "SSH_VPN_OBFS" in commands[0]
+    assert 'obfs.py" serve' in commands[0]
     assert "SSH_VPN_ADDR" in commands[0]
     assert "ip rule del table 2124" in commands[0]
     assert "conntrack -D -s 10.255.0.0/16" in commands[0]
@@ -126,6 +131,23 @@ def test_ssh_command_quotes_multiline_script_as_one_bash_argument() -> None:
     assert "TCPKeepAlive=yes" in command
     assert "ServerAliveInterval=5" in command
     assert "ServerAliveCountMax=2" in command
+
+
+def test_tun_ssh_goes_through_the_tls_forwarder() -> None:
+    pin = "ab" * 32
+    command = ssh_tunnel._ssh_command(
+        "192.168.50.2",
+        "root",
+        "echo SSH_VPN_READY",
+        binding=CLAIMED,
+        obfs=(443, pin),
+    )
+
+    proxy = next(part.split("=", 1)[1] for part in command if part.startswith("ProxyCommand="))
+    assert proxy == f"python3 -m ssh_vpn_gui.obfs relay 192.168.50.2 443 {pin}"
+    assert "-p" not in command
+    plain = ssh_tunnel._ssh_command("192.168.50.2", "root", "echo ok", with_tun=False)
+    assert not any(part.startswith("ProxyCommand=") for part in plain)
 
 
 def test_start_tunnel_dry_run_inserts_ovpn_bootstrap_before_tun() -> None:
@@ -190,6 +212,7 @@ def test_start_tunnel_runs_ovpn_bootstrap_step(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(ssh_tunnel, "STATE_DIR", tmp_path)
     monkeypatch.setattr(ssh_tunnel, "ensure_data_dir", lambda: None)
     monkeypatch.setattr(ssh_tunnel, "stop_tunnel", lambda dry_run=False: [])
+    monkeypatch.setattr(ssh_tunnel, "port_reachable", lambda *_args, **_kwargs: True)
     def fake_ssh(command, password, **kwargs):
         message = kwargs.get("success_message")
         ssh_calls.append(message)

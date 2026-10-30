@@ -1,3 +1,15 @@
+ssh-vpn-gui (0.2.42) unstable; urgency=medium
+
+  * Send the long SSH tunnel inside TLS, so the connection looks like
+    ordinary data transfer instead of SSH. A short plain SSH session
+    still starts a forwarder on the server (port 443, or 8443 or 2053
+    if 443 is taken). The tunnel client pins that certificate and
+    refuses a different one. An HTTP probe gets a short file response;
+    only an SSH banner is forwarded to sshd. The server needs python3,
+    openssl, and the chosen port open in the provider firewall.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 30 Oct 2026 11:52:11 +0300
+
 ssh-vpn-gui (0.2.41) unstable; urgency=medium
 
   * Keep interactive-looking traffic on the SSH session that carries the
