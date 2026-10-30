@@ -604,7 +604,7 @@ def cleanup_legacy_singbox(runner: CommandRunner) -> None:
     runner.run(["pkill", "-f", "sing-box run -c /run/ssh-vpn-gui/sing-box.json"], check=False)
 
 
-def remote_bootstrap_script() -> str:
+def remote_bootstrap_script(*, tls: bool = False) -> str:
     return """
 set -eu
 changed=0
@@ -686,7 +686,7 @@ done
 __SSH_VPN_OBFS__
 echo SSH_VPN_BOOTSTRAP_READY
 """.replace("__SSH_VPN_CASCADE_STOP__", _remote_cascade_stop_snippet()).replace(
-        "__SSH_VPN_OBFS__", _remote_obfs_snippet()
+        "__SSH_VPN_OBFS__", _remote_obfs_snippet() if tls else ""
     ).strip()
 
 

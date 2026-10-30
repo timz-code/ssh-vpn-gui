@@ -1,3 +1,3 @@
 """SSH VPN GUI package."""
 
-__version__ = "0.2.42"
+__version__ = "0.2.43"

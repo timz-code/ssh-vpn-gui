@@ -473,6 +473,17 @@ class SshVpnWindow(Adw.ApplicationWindow):
         routing_row.add_suffix(self.routing_switch)
         routing_row.set_activatable_widget(self.routing_switch)
 
+        self.tls_switch = Gtk.CheckButton()
+        self.tls_switch.set_valign(Gtk.Align.CENTER)
+        self.tls_switch.set_active(saved_config["tls"])
+        self.tls_switch.connect("toggled", self._on_tls_toggled)
+        tls_row = Adw.ActionRow(
+            title="Hide tunnel as TLS",
+            subtitle="Send the tunnel as TLS data transfer. The server needs an open port, usually 443. Applies on the next connection.",
+        )
+        tls_row.add_suffix(self.tls_switch)
+        tls_row.set_activatable_widget(self.tls_switch)
+
         self.cascade_mode: str = saved_config["cascade_mode"]
         self.cascade_dropdown = Gtk.DropDown.new(Gtk.StringList.new(list(CASCADE_CHOICES)), None)
         self.cascade_dropdown.set_factory(_full_text_factory())
@@ -571,6 +582,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
         group = Adw.PreferencesGroup(title="Connection")
         group.add(self.server_row.row)
         group.add(routing_row)
+        group.add(tls_row)
         group.add(self.cascade_row)
         group.add(self.ovpn_row.row)
         group.add(self.socks5_row.row)
@@ -629,9 +641,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
             return
 
         self._save_config()
-        args = ["connect", "--server", server["host"], "--login", server["login"]]
-        if not self.routing_switch.get_active():
-            args.append("--no-routing")
+        args = self._connect_args(server)
         args.extend(cascade_args)
         self._connecting_server = dict(server)
         self._run_helper(
@@ -665,9 +675,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self._auto_reconnects = 0
         self._auto_connect_in_flight = False
         self._cancel_slow_reconnect()
-        args = ["connect", "--server", target["host"], "--login", target["login"]]
-        if not self.routing_switch.get_active():
-            args.append("--no-routing")
+        args = self._connect_args(target)
         args.extend(cascade_args)
         args.extend(["--previous-server", previous["host"], "--previous-login", previous["login"]])
         self._connecting_server = dict(target)
@@ -1008,11 +1016,26 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self.ovpn_row.row.set_visible(kind == "ovpn")
         self.socks5_row.row.set_visible(kind == "socks5")
 
+    def _connect_args(self, server: dict[str, str]) -> list[str]:
+        args = ["connect", "--server", server["host"], "--login", server["login"]]
+        if not self.routing_switch.get_active():
+            args.append("--no-routing")
+        if self.tls_switch.get_active():
+            args.append("--tls")
+        return args
+
+    def _on_tls_toggled(self, _button: Gtk.CheckButton) -> None:
+        self._save_config()
+        if self.connected and not self.busy:
+            state = "on" if self.tls_switch.get_active() else "off"
+            self._set_status(f"TLS hiding is {state}. It applies on the next connection.")
+
     def _save_config(self) -> None:
         save_config(
             servers=self.servers,
             selected=self.server_row.selected() or 0,
             routing=self.routing_switch.get_active(),
+            tls=self.tls_switch.get_active(),
             cascade_mode=self.cascade_mode,
             ovpn_files=self.ovpn_files,
             ovpn_selected=self.ovpn_row.selected() or 0,
@@ -1515,6 +1538,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self.edit_routing_button.set_sensitive(available)
         self.diagnose_button.set_sensitive(available)
         self.routing_switch.set_sensitive(available)
+        self.tls_switch.set_sensitive(available)
         self.cascade_dropdown.set_sensitive(available)
         self._update_list_controls()
         self._update_exit_restore_button()
@@ -1978,6 +2002,7 @@ def load_saved_config() -> dict:
         "servers": servers,
         "selected": selected,
         "routing": bool(data.get("routing", True)),
+        "tls": bool(data.get("tls", False)),
         "cascade_mode": cascade_mode,
         "ovpn_files": ovpn_files,
         "ovpn_selected": ovpn_selected,
@@ -1991,6 +2016,7 @@ def save_config(
     servers: list[dict[str, str]],
     selected: int = 0,
     routing: bool = True,
+    tls: bool = False,
     cascade_mode: str = "none",
     ovpn_files: list[dict[str, str]] | None = None,
     ovpn_selected: int = 0,
@@ -2004,6 +2030,7 @@ def save_config(
                 "servers": servers,
                 "selected": selected,
                 "routing": routing,
+                "tls": tls,
                 "cascade_mode": cascade_mode,
                 "ovpn_files": ovpn_files or [],
                 "ovpn_selected": ovpn_selected,

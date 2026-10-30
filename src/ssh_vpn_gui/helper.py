@@ -216,6 +216,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--routing-file", default=str(SYSTEM_ROUTING_FILE))
     parser.add_argument("--no-routing", action="store_true", help="Connect SSH TUN without starting routing rules")
     parser.add_argument(
+        "--tls",
+        action="store_true",
+        help="Carry the SSH tunnel inside TLS so it looks like data transfer",
+    )
+    parser.add_argument(
         "--fail-closed",
         action="store_true",
         help="On disconnect, block non-direct traffic instead of restoring the system default",
@@ -371,6 +376,7 @@ def _connect(
                 password,
                 dry_run=args.dry_run,
                 cascade=cascade,
+                tls=args.tls,
                 on_progress=_gui_progress,
             )
         )

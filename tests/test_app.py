@@ -15,6 +15,7 @@ def test_save_config_persists_servers_and_checkboxes(monkeypatch, tmp_path) -> N
         selected=1,
         routing=False,
         cascade_mode="socks5",
+        tls=True,
         ovpn_files=[{"name": "Netherlands", "path": "/tmp/nl.ovpn"}, {"name": "", "path": "/tmp/de.ovpn"}],
         ovpn_selected=1,
         socks5_proxies=[
@@ -31,6 +32,7 @@ def test_save_config_persists_servers_and_checkboxes(monkeypatch, tmp_path) -> N
         ],
         "selected": 1,
         "routing": False,
+        "tls": True,
         "cascade_mode": "socks5",
         "ovpn_files": [{"name": "Netherlands", "path": "/tmp/nl.ovpn"}, {"name": "", "path": "/tmp/de.ovpn"}],
         "ovpn_selected": 1,
@@ -93,6 +95,7 @@ def test_load_saved_config_without_a_file_has_every_setting(monkeypatch, tmp_pat
         "servers": [],
         "selected": 0,
         "routing": True,
+        "tls": False,
         "cascade_mode": "none",
         "ovpn_files": [],
         "ovpn_selected": 0,
@@ -137,6 +140,7 @@ def test_load_saved_config_migrates_single_server(monkeypatch, tmp_path) -> None
     ]
     assert loaded["selected"] == 0
     assert loaded["routing"] is True
+    assert loaded["tls"] is False
 
 
 def test_upsert_replaces_same_login_and_remove_keeps_neighbor() -> None:

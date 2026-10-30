@@ -1,3 +1,12 @@
+ssh-vpn-gui (0.2.43) unstable; urgency=medium
+
+  * TLS hiding is a checkbox, off unless the user turns it on. Hide
+    tunnel as TLS sends the tunnel as TLS data transfer on the next
+    connection. With the box unticked the tunnel is plain SSH again
+    and the saved TLS pin is dropped.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 30 Oct 2026 11:58:17 +0300
+
 ssh-vpn-gui (0.2.42) unstable; urgency=medium
 
   * Send the long SSH tunnel inside TLS, so the connection looks like

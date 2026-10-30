@@ -47,9 +47,12 @@ def start_tunnel(
     dry_run: bool = False,
     timeout: int = 30,
     cascade: Cascade | None = None,
+    tls: bool = False,
     on_progress: Callable[[str], None] | None = None,
 ) -> list[str]:
-    bootstrap_command = _ssh_command(server, login, remote_bootstrap_script(), with_tun=False)
+    bootstrap_command = _ssh_command(
+        server, login, remote_bootstrap_script(tls=tls), with_tun=False
+    )
     if dry_run:
         binding = placeholder_tunnel_binding()
         commands = [_quoted(bootstrap_command)]
@@ -74,18 +77,21 @@ def start_tunnel(
         raise SshTunnelError(str(exc)) from exc
     binding = replace(binding, server=server)
     save_tunnel_state(binding)
-    obfs = parse_obfs_line(messages)
-    if obfs is None:
-        raise SshTunnelError("server did not start the TLS forwarder")
-    obfs_port, obfs_pin = obfs
-    _save_obfs(obfs_port, obfs_pin)
-    if not port_reachable(server, obfs_port):
-        raise SshTunnelError(
-            f"TLS port {obfs_port} on the server is not reachable. "
-            "Open that port in the VPS provider firewall. "
-            "The tunnel is sent as TLS data transfer, not as SSH."
-        )
-    messages.append(f"hiding the tunnel as TLS data transfer on port {obfs_port}")
+    if tls:
+        obfs = parse_obfs_line(messages)
+        if obfs is None:
+            raise SshTunnelError("server did not start the TLS forwarder")
+        obfs_port, obfs_pin = obfs
+        _save_obfs(obfs_port, obfs_pin)
+        if not port_reachable(server, obfs_port):
+            raise SshTunnelError(
+                f"TLS port {obfs_port} on the server is not reachable. "
+                "Open that port in the VPS provider firewall. "
+                "The tunnel is sent as TLS data transfer, not as SSH."
+            )
+        messages.append(f"hiding the tunnel as TLS data transfer on port {obfs_port}")
+    else:
+        _clear_obfs()
     messages.append(
         f"using {binding.local_tun} <-> {binding.remote_tun} "
         f"({binding.local_address} <-> {binding.remote_address})"
@@ -253,6 +259,13 @@ def _start_cascade(
 
 def _cascade_command(server: str, login: str, cascade: Cascade, binding: TunnelBinding) -> list[str]:
     return _ssh_command(server, login, remote_cascade_script(cascade, binding), with_tun=False)
+
+
+def _clear_obfs() -> None:
+    try:
+        (STATE_DIR / "obfs.env").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _save_obfs(port: int, fingerprint: str) -> None:

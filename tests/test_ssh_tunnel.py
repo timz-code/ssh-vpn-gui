@@ -114,12 +114,21 @@ def test_start_tunnel_dry_run_bootstraps_before_tun() -> None:
     assert not re.search(r"-w \d+:\d+", commands[0])
     assert "PermitTunnel point-to-point" in commands[0]
     assert "SSH_VPN_REMOTE_TUN" in commands[0]
-    assert "SSH_VPN_OBFS" in commands[0]
-    assert 'obfs.py" serve' in commands[0]
+    assert "SSH_VPN_OBFS" not in commands[0]
     assert "SSH_VPN_ADDR" in commands[0]
     assert "ip rule del table 2124" in commands[0]
     assert "conntrack -D -s 10.255.0.0/16" in commands[0]
     assert re.search(r"-w \d+:\d+", commands[1])
+
+
+def test_start_tunnel_dry_run_hides_in_tls_only_when_asked() -> None:
+    plain = ssh_tunnel.start_tunnel("192.168.50.2", "root", "secret", dry_run=True)
+    hidden = ssh_tunnel.start_tunnel("192.168.50.2", "root", "secret", dry_run=True, tls=True)
+
+    assert "SSH_VPN_OBFS" not in plain[0]
+    assert "SSH_VPN_OBFS" in hidden[0]
+    assert 'obfs.py" serve' in hidden[0]
+    assert not any(part.startswith("ProxyCommand=") for part in plain[1].split())
 
 
 def test_ssh_command_quotes_multiline_script_as_one_bash_argument() -> None:
