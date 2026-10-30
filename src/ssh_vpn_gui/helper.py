@@ -564,6 +564,12 @@ def _diagnose(server: str | None) -> list[str]:
         completed = subprocess.run(command, text=True, capture_output=True, check=False)
         messages.append("$ " + " ".join(command))
         messages.append((completed.stdout or completed.stderr).strip())
+    from .obfs import relay_log_tail
+
+    relay_tail = relay_log_tail()
+    if relay_tail:
+        messages.append("$ TLS relay log (which layer dropped first)")
+        messages.extend(relay_tail)
     return messages
 
 

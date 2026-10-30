@@ -1,3 +1,4 @@
+import os
 import socket
 import ssl
 import subprocess
@@ -7,6 +8,74 @@ from ssh_vpn_gui import obfs
 
 
 PIN = "ab" * 32
+
+
+class _FakeTLS:
+    """Minimal TLS stand-in for _splice_stdio verdict tests."""
+
+    def __init__(self, *, block: threading.Event | None = None) -> None:
+        self._block = block
+        self.closed = False
+
+    def recv(self, _size: int) -> bytes:
+        if self._block is not None:
+            self._block.wait()
+        return b""  # EOF
+
+    def sendall(self, _data: bytes) -> None:  # pragma: no cover - unused here
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+        if self._block is not None:
+            self._block.set()  # release a blocked recv so its thread can exit
+
+    def settimeout(self, _value) -> None:
+        pass
+
+
+def test_splice_reports_tls_closed_first() -> None:
+    r_in, w_in = os.pipe()
+    r_out, w_out = os.pipe()
+    try:
+        side, reason = obfs._splice_stdio(_FakeTLS(), incoming=r_in, outgoing=w_out)
+        assert side == "tls"
+        assert reason == "eof"
+    finally:
+        for fd in (r_in, w_in, r_out, w_out):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def test_splice_reports_ssh_closed_first() -> None:
+    block = threading.Event()
+    r_in, w_in = os.pipe()
+    r_out, w_out = os.pipe()
+    os.close(w_in)  # closing the write end makes the ssh side read EOF first
+    try:
+        side, reason = obfs._splice_stdio(
+            _FakeTLS(block=block), incoming=r_in, outgoing=w_out
+        )
+        assert side == "ssh"
+        assert reason == "eof"
+    finally:
+        for fd in (r_in, r_out, w_out):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def test_relay_log_records_verdict(tmp_path, monkeypatch) -> None:
+    import ssh_vpn_gui.system as system
+
+    monkeypatch.setattr(system, "STATE_DIR", tmp_path)
+    obfs.relay_log("connected on port 443")
+    obfs.relay_log("TLS tunnel closed first [tls:eof] on port 443")
+    assert obfs.last_relay_verdict().endswith("[tls:eof] on port 443")
+    assert len(obfs.relay_log_tail()) == 2
 
 
 def test_installer_script_is_bash_and_pins_the_certificate() -> None:

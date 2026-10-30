@@ -17,6 +17,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 
 OBFS_PORTS = (443, 8443, 2053)
 _HTTP_PREFACE = (b"GET ", b"POST", b"HEAD", b"PUT ", b"PRI ")
@@ -194,33 +195,94 @@ def open_pinned(host: str, port: int, fingerprint: str, *, timeout: float = 20.0
     return tls
 
 
+def relay_log(message: str) -> None:
+    """Record a relay lifecycle line to STATE_DIR/obfs-relay.log.
+
+    Best effort and payload-free: only timestamps and which layer closed,
+    never any tunnelled bytes. Lets us answer "TLS or SSH dropped first?".
+    """
+    try:
+        from .system import STATE_DIR
+
+        path = STATE_DIR / "obfs-relay.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{stamp} {message}\n")
+    except Exception:
+        pass
+
+
+def relay_log_tail(limit: int = 12) -> list[str]:
+    try:
+        from .system import STATE_DIR
+
+        text = (STATE_DIR / "obfs-relay.log").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    lines = [line for line in text.splitlines() if line.strip()]
+    return lines[-limit:]
+
+
+def last_relay_verdict() -> str | None:
+    tail = relay_log_tail(limit=1)
+    return tail[0] if tail else None
+
+
 def relay(host: str, port: int, fingerprint: str) -> int:
     try:
         tls = open_pinned(host, port, fingerprint)
     except ObfsPinError as exc:
         print(str(exc), file=sys.stderr)
+        relay_log(f"pin-rejected on port {port}: {exc}")
         return 1
     except OSError as exc:
         print(f"TLS forwarder unreachable: {exc}", file=sys.stderr)
+        relay_log(f"connect-failed on port {port}: {exc}")
         return 1
-    _splice_stdio(tls)
+    relay_log(f"connected on port {port}")
+    side, reason = _splice_stdio(tls)
+    if side == "tls":
+        label = "TLS tunnel closed first"
+    elif side == "ssh":
+        label = "SSH stream closed first"
+    else:
+        label = "closed (side unknown)"
+    relay_log(f"{label} [{side}:{reason}] on port {port}")
     return 0
 
 
-def _splice_stdio(tls: ssl.SSLSocket) -> None:
-    outgoing = sys.stdout.fileno()
-    incoming = sys.stdin.fileno()
+def _splice_stdio(
+    tls: ssl.SSLSocket,
+    *,
+    incoming: int | None = None,
+    outgoing: int | None = None,
+) -> tuple[str, str]:
+    """Copy stdin<->TLS and report which side closed first.
+
+    Returns ``(side, reason)``. ``side`` is ``"tls"`` when the obfuscation/TLS
+    layer dropped first (server or DPI tore the outer connection) and ``"ssh"``
+    when our inner SSH closed its ProxyCommand pipe first.
+    """
+    outgoing = sys.stdout.fileno() if outgoing is None else outgoing
+    incoming = sys.stdin.fileno() if incoming is None else incoming
     done = threading.Event()
+    verdict: dict[str, tuple[str, str]] = {}
+
+    def mark(side: str, reason: str) -> None:
+        # setdefault keeps the first writer: the side that closed first wins.
+        verdict.setdefault("first", (side, reason))
 
     def from_server() -> None:
         try:
             while True:
                 data = tls.recv(65536)
                 if not data:
+                    mark("tls", "eof")
                     break
                 os.write(outgoing, data)
-        except Exception:
-            pass
+        except Exception as exc:
+            mark("tls", f"recv-error: {exc.__class__.__name__}")
         done.set()
 
     threading.Thread(target=from_server, daemon=True).start()
@@ -229,18 +291,26 @@ def _splice_stdio(tls: ssl.SSLSocket) -> None:
             ready, _, _ = select.select([incoming], [], [], 0.5)
             if not ready:
                 continue
-            data = os.read(incoming, 65536)
-            if not data:
+            try:
+                data = os.read(incoming, 65536)
+            except Exception as exc:
+                mark("ssh", f"read-error: {exc.__class__.__name__}")
                 break
-            tls.sendall(data)
-    except Exception:
-        pass
+            if not data:
+                mark("ssh", "eof")
+                break
+            try:
+                tls.sendall(data)
+            except Exception as exc:
+                mark("tls", f"send-error: {exc.__class__.__name__}")
+                break
     finally:
         done.set()
         try:
             tls.close()
         except Exception:
             pass
+    return verdict.get("first", ("unknown", "closed"))
 
 
 def serve(

@@ -1,3 +1,11 @@
+ssh-vpn-gui (0.2.46) unstable; urgency=medium
+
+  * Diagnose which layer drops first when a hidden tunnel falls. The
+    TLS relay now records whether the TLS layer or the inner SSH stream
+    closed first to /run/ssh-vpn-gui/obfs-relay.log, the tunnel daemon
+    adds its own end reason, and Diagnose shows the last lines.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 30 Oct 2026 12:45:16 +0300
 ssh-vpn-gui (0.2.45) unstable; urgency=medium
 
   * The TLS forwarder script never ran. Its heredoc closer was glued

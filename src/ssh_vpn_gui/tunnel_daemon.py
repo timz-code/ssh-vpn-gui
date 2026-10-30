@@ -8,7 +8,7 @@ import time
 import pexpect
 
 from .ssh_tunnel import _ssh_command
-from .obfs import load_obfs
+from .obfs import load_obfs, relay_log
 from .system import load_tunnel_state, mark_fail_closed, remote_setup_script
 from .tunnel_watch import is_tun_peer_reachable, should_drop_unresponsive_peer
 
@@ -38,8 +38,9 @@ def main(argv: list[str] | None = None) -> int:
         print("missing tunnel binding in /run/ssh-vpn-gui/tunnel.env", file=sys.stderr)
         return 2
 
+    obfs = load_obfs()
     command = _ssh_command(
-        server, login, remote_setup_script(binding), binding=binding, obfs=load_obfs()
+        server, login, remote_setup_script(binding), binding=binding, obfs=obfs
     )
     child = pexpect.spawn(
         command[0],
@@ -51,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
 
     stopping = False
     ready = False
+    drop_reason = "ssh process exited"
 
     def stop(_signum: int, _frame: object) -> None:
         nonlocal stopping
@@ -109,11 +111,13 @@ def main(argv: list[str] | None = None) -> int:
                     failures=peer_failures, elapsed_seconds=elapsed
                 ):
                     print("Tunnel peer stopped responding", file=sys.stderr, flush=True)
+                    drop_reason = "tun peer stopped responding"
                     child.close(force=True)
                     return 1
             now = time.monotonic()
             if now >= next_chat:
                 if not _exchange_chatter(child):
+                    drop_reason = "ssh session closed (chatter EOF)"
                     break
                 next_chat = time.monotonic() + random.uniform(CHAT_INTERVAL_MIN, CHAT_INTERVAL_MAX)
                 continue
@@ -122,6 +126,10 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         child.close(force=True)
         if ready and not stopping:
+            if obfs is not None:
+                # Correlate with the relay's own verdict line so the log shows
+                # whether the TLS layer or the SSH stream closed first.
+                relay_log(f"daemon: tunnel ended ({drop_reason})")
             _mark_dropped()
 
 
