@@ -17,8 +17,12 @@ def test_installer_script_is_bash_and_pins_the_certificate() -> None:
     assert "dnf install -y python3 openssl" in script
     assert "python3 is required" not in script
     assert "openssl req -x509" in script
+    mark = "SSH_VPN_OBFS_SOURCE_" + "END"
+    closer_at = script.index(f"\n{mark}\n")
+    assert 'echo SSH_VPN_OBFS "$port"' in script[closer_at:]
     checked = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True, check=False)
     assert checked.returncode == 0, checked.stderr
+    assert "here-document" not in checked.stderr
 
 
 def test_tls_forwarder_hides_ssh_and_answers_http(tmp_path) -> None:

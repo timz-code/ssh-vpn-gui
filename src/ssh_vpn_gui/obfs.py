@@ -55,7 +55,10 @@ mkdir -p "$obfs_dir"
 chmod 700 "$obfs_dir"
 cat > "$obfs_dir/obfs.py" << '""" + _SOURCE_MARK + """'
 """
-    tail = _SOURCE_MARK + """
+    # The marker has to be a line of its own. A leading newline on the
+    # quoted string would be stripped off the marker and the heredoc
+    # would run to the end of the script without ever starting.
+    tail = "\n" + _SOURCE_MARK + "\n" + """\
 chmod 700 "$obfs_dir/obfs.py"
 if [ ! -s "$obfs_dir/obfs.crt" ] || [ ! -s "$obfs_dir/obfs.key" ]; then
   openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \\
@@ -109,8 +112,10 @@ if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: a
   ufw allow "$port"/tcp >/dev/null 2>&1 || true
 fi
 echo SSH_VPN_OBFS "$port" "$fp"
-""".strip()
-    return (head + source + "\n" + tail).strip()
+"""
+    if not source.endswith("\n"):
+        source += "\n"
+    return (head + source + tail).strip() + "\n"
 
 
 def parse_obfs_line(lines: list[str]) -> tuple[int, str] | None:

@@ -1,3 +1,14 @@
+ssh-vpn-gui (0.2.45) unstable; urgency=medium
+
+  * The TLS forwarder script never ran. Its heredoc closer was glued
+    to the next command, so the shell stored the start commands in a
+    file and exited successfully. The client then reported that the
+    server did not start the forwarder.
+  * Ticking Hide tunnel as TLS while connected rebuilds the tunnel
+    immediately.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 30 Oct 2026 12:18:15 +0300
+
 ssh-vpn-gui (0.2.44) unstable; urgency=medium
 
   * Keep the TLS forwarder's port and certificate pin from the server

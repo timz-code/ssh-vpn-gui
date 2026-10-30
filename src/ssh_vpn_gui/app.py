@@ -479,7 +479,7 @@ class SshVpnWindow(Adw.ApplicationWindow):
         self.tls_switch.connect("toggled", self._on_tls_toggled)
         tls_row = Adw.ActionRow(
             title="Hide tunnel as TLS",
-            subtitle="Send the tunnel as TLS data transfer. The server needs an open port, usually 443. Applies on the next connection.",
+            subtitle="Send the tunnel as TLS data transfer. The server needs an open port, usually 443.",
         )
         tls_row.add_suffix(self.tls_switch)
         tls_row.set_activatable_widget(self.tls_switch)
@@ -1027,8 +1027,35 @@ class SshVpnWindow(Adw.ApplicationWindow):
     def _on_tls_toggled(self, _button: Gtk.CheckButton) -> None:
         self._save_config()
         if self.connected and not self.busy:
-            state = "on" if self.tls_switch.get_active() else "off"
-            self._set_status(f"TLS hiding is {state}. It applies on the next connection.")
+            self._reconnect_for_tls()
+
+    def _reconnect_for_tls(self) -> None:
+        """Rebuild the running tunnel so the checkbox takes effect now."""
+        server = self._active_server or self._selected_server()
+        if server is None or not server["login"] or not server["password"]:
+            self._set_status("Add a server with a login and password, then choose it.")
+            return
+        try:
+            cascade_args = self._cascade_args(self.cascade_mode)
+        except ValueError as exc:
+            self._set_status(str(exc))
+            return
+        self._auto_reconnects = 0
+        self._auto_connect_in_flight = False
+        self._cancel_slow_reconnect()
+        args = self._connect_args(server)
+        args.extend(cascade_args)
+        args.extend(["--previous-server", server["host"], "--previous-login", server["login"]])
+        self._connecting_server = dict(server)
+        hiding = self.tls_switch.get_active()
+        self._run_helper(
+            args,
+            password=server["password"],
+            previous_password=server["password"],
+            socks5_password=self._socks5_password(self.cascade_mode),
+            busy_text="Hiding the tunnel as TLS..." if hiding else "Turning TLS hiding off...",
+            action="switch",
+        )
 
     def _save_config(self) -> None:
         save_config(
