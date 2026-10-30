@@ -342,6 +342,7 @@ def _allocation_lines(output: str) -> list[str]:
         "SSH_VPN_REMOTE_OVPN ",
         "SSH_VPN_ADDR ",
         "SSH_VPN_USED",
+        "SSH_VPN_OBFS ",
     )
     return [
         line.strip()

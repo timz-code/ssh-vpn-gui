@@ -13,7 +13,9 @@ def test_installer_script_is_bash_and_pins_the_certificate() -> None:
     script = obfs.remote_installer_script()
 
     assert "SSH_VPN_OBFS" in script
-    assert "find /" not in script
+    assert "install -y python3 openssl" in script
+    assert "dnf install -y python3 openssl" in script
+    assert "python3 is required" not in script
     assert "openssl req -x509" in script
     checked = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True, check=False)
     assert checked.returncode == 0, checked.stderr

@@ -1,3 +1,14 @@
+ssh-vpn-gui (0.2.44) unstable; urgency=medium
+
+  * Keep the TLS forwarder's port and certificate pin from the server
+    reply. They were dropped on the way back, so a successful start was
+    reported as "server did not start the TLS forwarder".
+  * Install python3 and openssl on the server when Hide tunnel as TLS
+    is on, the same way a second hop installs its own packages. The
+    first such connection can take several minutes.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 30 Oct 2026 12:05:36 +0300
+
 ssh-vpn-gui (0.2.43) unstable; urgency=medium
 
   * TLS hiding is a checkbox, off unless the user turns it on. Hide

@@ -34,16 +34,20 @@ def certificate_fingerprint(der: bytes) -> str:
 
 def remote_installer_script() -> str:
     """Shell that installs the forwarder on the server and prints its pin."""
+    from .system import remote_install_snippet
+
     source = Path(__file__).read_text(encoding="utf-8")
     if _SOURCE_MARK in source:
         raise RuntimeError("obfs source contains the installer marker")
-    head = """
-command -v python3 >/dev/null 2>&1 || {
-  echo 'python3 is required on the server to hide the tunnel' >&2
-  exit 1
-}
-command -v openssl >/dev/null 2>&1 || {
-  echo 'openssl is required on the server to hide the tunnel' >&2
+    install = remote_install_snippet(
+        "Python 3 and OpenSSL",
+        present="command -v python3 >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1",
+        apt="python3 openssl",
+        dnf="python3 openssl",
+    )
+    head = install + """
+command -v python3 >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 || {
+  echo 'python3 and openssl are still missing after installation' >&2
   exit 1
 }
 obfs_dir=/var/lib/ssh-vpn-gui
@@ -56,7 +60,10 @@ chmod 700 "$obfs_dir/obfs.py"
 if [ ! -s "$obfs_dir/obfs.crt" ] || [ ! -s "$obfs_dir/obfs.key" ]; then
   openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \\
     -keyout "$obfs_dir/obfs.key" -out "$obfs_dir/obfs.crt" \\
-    -subj "/CN=ssh-vpn-gui" >/dev/null 2>&1
+    -subj "/CN=ssh-vpn-gui" || {
+    echo 'openssl could not create the TLS certificate' >&2
+    exit 1
+  }
 fi
 chmod 600 "$obfs_dir/obfs.key"
 if [ -f "$obfs_dir/obfs.pid" ]; then
@@ -82,6 +89,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27
 done
 [ "$ready" -eq 1 ] || {
   echo 'TLS forwarder did not start' >&2
+  tail -n 20 "$obfs_dir/obfs.log" >&2 || true
   exit 1
 }
 port=$(cat "$obfs_dir/obfs.port")

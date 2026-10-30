@@ -1681,7 +1681,9 @@ def _helper_timeout(args: list[str]) -> int:
     if command == "disconnect" and "--local-only" in args:
         return 20
     timeout = 90
-    if command == "cascade-on" or (command == "connect" and ("--cascade" in args or "--ovpn-file" in args)):
+    if command == "cascade-on" or (
+        command == "connect" and ("--cascade" in args or "--ovpn-file" in args or "--tls" in args)
+    ):
         timeout = CASCADE_HELPER_TIMEOUT_SECONDS
     if "--previous-server" in args:
         # Closing the old tunnel includes an SSH cleanup on the old server.

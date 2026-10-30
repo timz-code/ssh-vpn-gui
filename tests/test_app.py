@@ -270,6 +270,7 @@ def test_cascade_on_uses_install_timeout() -> None:
     assert app._helper_timeout(["connect", "--ovpn-file", "x.ovpn"]) == 660
     assert app._helper_timeout(["connect", "--cascade", "tor"]) == 660
     assert app._helper_timeout(["connect", "--server", "203.0.113.10"]) == 90
+    assert app._helper_timeout(["connect", "--tls", "--server", "192.168.50.2"]) == 660
     assert app._helper_timeout(["cascade-off"]) == 90
     assert app._helper_timeout(["status"]) == 10
     assert app._helper_timeout(["disconnect", "--local-only"]) == 20

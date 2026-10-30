@@ -131,6 +131,23 @@ def test_start_tunnel_dry_run_hides_in_tls_only_when_asked() -> None:
     assert not any(part.startswith("ProxyCommand=") for part in plain[1].split())
 
 
+def test_bootstrap_output_keeps_the_tls_forwarder_line() -> None:
+    pin = "ab" * 32
+    lines = ssh_tunnel._allocation_lines(
+        "\n".join(
+            [
+                "SSH_VPN_REMOTE_TUN tun5",
+                f"SSH_VPN_OBFS 443 {pin}",
+                "SSH_VPN_BOOTSTRAP_READY",
+            ]
+        )
+    )
+
+    from ssh_vpn_gui.obfs import parse_obfs_line
+
+    assert parse_obfs_line(lines) == (443, pin)
+
+
 def test_ssh_command_quotes_multiline_script_as_one_bash_argument() -> None:
     script = "set -eu\necho 'ready now'\nprintf '%s\\n' \"$HOME\""
 
