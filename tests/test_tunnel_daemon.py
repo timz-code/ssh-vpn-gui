@@ -17,12 +17,13 @@ class FakeChild:
         self.after = ""
         self.before = ""
         self.exitstatus = 255
+        self.sent: list[str] = []
 
-    def expect(self, _patterns):
+    def expect(self, _patterns, timeout=None):
         return self._expect.pop(0)
 
-    def sendline(self, _text):
-        pass
+    def sendline(self, text):
+        self.sent.append(text)
 
     def isalive(self):
         value = self._alive.pop(0) if self._alive else False
@@ -84,6 +85,17 @@ def test_daemon_does_not_flag_a_requested_stop(monkeypatch) -> None:
         tunnel_daemon.main(["203.0.113.10", "root"])
     assert stopped.value.code == 0
     assert marks == []
+
+
+def test_daemon_pokes_the_session_and_reads_the_reply(monkeypatch) -> None:
+    intervals = iter([0.0, 100.0])
+    child = FakeChild([READY, 0], [True, False])
+    monkeypatch.setattr(tunnel_daemon.random, "uniform", lambda _low, _high: next(intervals))
+    monkeypatch.setattr(tunnel_daemon.random, "choice", lambda items: items[0])
+    _run_daemon(monkeypatch, child)
+
+    assert tunnel_daemon.main(["192.168.50.2", "root"]) == 255
+    assert child.sent == ["ls"]
 
 
 def test_daemon_does_not_flag_a_tunnel_that_never_came_up(monkeypatch) -> None:

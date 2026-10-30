@@ -1,3 +1,16 @@
+ssh-vpn-gui (0.2.41) unstable; urgency=medium
+
+  * Keep interactive-looking traffic on the SSH session that carries the
+    tunnel. The server used to sleep silently after the tunnel came up,
+    so the connection looked like a pure bulk tunnel. Now the client
+    sends a short line every 5 to 10 seconds and the server discards it
+    and replies with one cheap command (date, uptime, load, id, uname,
+    whoami, df of /, or hostname). Nothing walks the disk, and the line
+    from the client is never executed. This only reshapes an otherwise
+    quiet tunnel; it does not hide a tunnel under heavy traffic.
+
+ -- SSH VPN GUI Maintainers <maintainers@example.invalid>  Fri, 30 Oct 2026 10:45:48 +0300
+
 ssh-vpn-gui (0.2.40) unstable; urgency=medium
 
   * The Connected button shows how long the current tunnel has been up,

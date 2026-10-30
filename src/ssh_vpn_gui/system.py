@@ -803,7 +803,37 @@ ip rule add from {chosen.cidr} to {chosen.cidr} table main priority {CASCADE_KEE
 ip route replace {chosen.cidr} dev {chosen.remote_tun} table {CASCADE_TABLE} 2>/dev/null || true
 echo SSH_VPN_READY
 trap '{_remote_nat_cleanup_snippet(chosen.remote_tun, chosen.cidr)}; {_remote_forward_cleanup_snippet(chosen)}; nft delete table ip ssh_vpn_gui 2>/dev/null || true; ip addr flush dev {chosen.remote_tun} 2>/dev/null || true' EXIT
-while true; do sleep 3600; done
+{remote_session_chatter_loop()}
+""".strip()
+
+
+def remote_session_chatter_loop() -> str:
+    """Small, varied shell replies on the session channel that carries the tun.
+
+    Both ride the same TCP connection. A silent `sleep` leaves that
+    connection looking like a pure bulk tunnel. The line from the client
+    is thrown away; it is never executed. Nothing here walks the disk.
+    """
+    return r"""
+# The client's text is discarded. A fixed cheap command answers instead.
+while true; do
+  _ssh_vpn_read=0
+  read -t 12 _ssh_vpn_chat || _ssh_vpn_read=$?
+  if [ "$_ssh_vpn_read" -eq 1 ]; then
+    sleep 12
+  fi
+  case $((RANDOM % 8)) in
+    0) _ssh_vpn_line=$(date -u '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true) ;;
+    1) _ssh_vpn_line=$(uptime 2>/dev/null || true) ;;
+    2) _ssh_vpn_line=$(cat /proc/loadavg 2>/dev/null || true) ;;
+    3) _ssh_vpn_line=$(id 2>/dev/null || true) ;;
+    4) _ssh_vpn_line=$(uname -srm 2>/dev/null || true) ;;
+    5) _ssh_vpn_line=$(whoami 2>/dev/null || true) ;;
+    6) _ssh_vpn_line=$(df -P / 2>/dev/null | awk 'NR==2 {print $1, $2, $3, $4}' || true) ;;
+    *) _ssh_vpn_line=$(hostname 2>/dev/null || true) ;;
+  esac
+  printf 'SSH_VPN_CHAT %s\n' "${_ssh_vpn_line:-ok}"
+done
 """.strip()
 
 

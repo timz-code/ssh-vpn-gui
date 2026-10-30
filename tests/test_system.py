@@ -349,3 +349,35 @@ def test_preserve_server_route_refresh_keeps_the_old_pin_without_a_default(monke
     system.preserve_server_route(runner, "203.0.113.10", refresh=True)
 
     assert runner.commands == ["ip -4 route show default"]
+
+
+def test_session_chatter_discards_the_client_line_and_stays_small() -> None:
+    script = system.remote_session_chatter_loop()
+    setup = system.remote_setup_script(
+        system.TunnelBinding(
+            local_tun="tun4",
+            remote_tun="tun7",
+            local_address="10.255.8.1",
+            remote_address="10.255.8.2",
+            cidr="10.255.8.0/30",
+        )
+    )
+
+    assert "SSH_VPN_CHAT" in script
+    assert "read -t 12 _ssh_vpn_chat" in script
+    assert "find /" not in script
+    assert "eval " not in script
+    assert script in setup
+    assert "sleep 3600" not in setup
+
+    checked = subprocess.run(
+        ["timeout", "3", "bash", "-c", "set -eu\n" + script],
+        input="find / -name a*\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert checked.returncode == 124
+    assert checked.stdout.startswith("SSH_VPN_CHAT ")
+    assert "find" not in checked.stdout
+    assert len(checked.stdout) < 400

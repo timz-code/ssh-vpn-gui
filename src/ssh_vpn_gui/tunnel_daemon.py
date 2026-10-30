@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import signal
 import sys
 import time
@@ -9,6 +10,13 @@ import pexpect
 from .ssh_tunnel import _ssh_command
 from .system import load_tunnel_state, mark_fail_closed, remote_setup_script
 from .tunnel_watch import is_tun_peer_reachable, should_drop_unresponsive_peer
+
+
+# The server waits up to 12s for a poke, so the client must speak first.
+CHAT_INTERVAL_MIN = 5.0
+CHAT_INTERVAL_MAX = 10.0
+# Sent as typing and discarded by the server. The reply is its own command.
+CHAT_POKES = ("ls", "pwd", "uptime", "date", "id", "w", "who", "df -h")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -86,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         ready_at = time.monotonic()
         peer_failures = 0
         peer_seen = False
+        next_chat = time.monotonic() + random.uniform(CHAT_INTERVAL_MIN, CHAT_INTERVAL_MAX)
         while child.isalive():
             if is_tun_peer_reachable(timeout=1.5):
                 peer_failures = 0
@@ -99,12 +108,30 @@ def main(argv: list[str] | None = None) -> int:
                     print("Tunnel peer stopped responding", file=sys.stderr, flush=True)
                     child.close(force=True)
                     return 1
-            time.sleep(2)
+            now = time.monotonic()
+            if now >= next_chat:
+                if not _exchange_chatter(child):
+                    break
+                next_chat = time.monotonic() + random.uniform(CHAT_INTERVAL_MIN, CHAT_INTERVAL_MAX)
+                continue
+            time.sleep(min(2.0, next_chat - now))
         return child.exitstatus or 0
     finally:
         child.close(force=True)
         if ready and not stopping:
             _mark_dropped()
+
+
+def _exchange_chatter(child: pexpect.spawn) -> bool:
+    """One short line out, one short reply back. False when the session is gone."""
+    child.sendline(random.choice(CHAT_POKES))
+    try:
+        child.expect(r"SSH_VPN_CHAT [^\r\n]*", timeout=5)
+    except pexpect.TIMEOUT:
+        return True
+    except pexpect.EOF:
+        return False
+    return True
 
 
 def _mark_dropped() -> None:
